@@ -32,6 +32,74 @@ if (!fs.existsSync(SESSIONS_DIR)) {
   fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 }
 
+
+// Control de filtrado: true = solo procesar mensajes con metadatos de anuncios de Meta
+const ONLY_META_ADS = process.env.ONLY_META_ADS !== 'false';
+
+// Conjunto de números guardados en tu agenda telefónica (para excluir familia, amigos, etc.)
+const savedContacts = new Set();
+
+/**
+ * Extrae y valida metadatos nativos de anuncios de Meta (Click-to-WhatsApp Ads / CTWA)
+ */
+function extractMetaAdInfo(msg) {
+  const m = msg.message;
+  if (!m) return null;
+
+  const context =
+    m.extendedTextMessage?.contextInfo ||
+    m.imageMessage?.contextInfo ||
+    m.videoMessage?.contextInfo ||
+    m.documentMessage?.contextInfo ||
+    m.buttonsResponseMessage?.contextInfo ||
+    m.templateButtonReplyMessage?.contextInfo ||
+    m.interactiveResponseMessage?.contextInfo ||
+    m.contextInfo ||
+    null;
+
+  if (!context) return null;
+
+  const source = String(context.entryPointConversionSource || '').toLowerCase();
+  const app = String(context.entryPointConversionApp || '').toLowerCase();
+  const extSource = String(context.entryPointConversionExternalSource || '').toLowerCase();
+  const conversionSource = String(context.conversionSource || '').toLowerCase();
+
+  // 1. Validar si proviene de canal publicitario de Meta
+  const isMetaSource =
+    source.includes('ad') ||
+    source.includes('ctwa') ||
+    source.includes('fb') ||
+    source.includes('ig') ||
+    source.includes('meta') ||
+    app.includes('facebook') ||
+    app.includes('instagram') ||
+    extSource.includes('ad') ||
+    conversionSource.includes('ad');
+
+  // 2. Token o señales criptográficas de CTWA
+  const hasCtwa = Boolean(context.ctwaPayload || context.ctwaSignals);
+
+  // 3. Respuesta a un anuncio específico
+  const hasAdReply = Boolean(context.externalAdReply || context.quotedAd);
+
+  // 4. Identificador de campaña de anuncios
+  const hasCampaign = Boolean(context.smbServerCampaignId || context.smbClientCampaignId);
+
+  if (isMetaSource || hasCtwa || hasAdReply || hasCampaign) {
+    return {
+      isAd: true,
+      source: context.entryPointConversionSource || context.entryPointConversionApp || 'meta_ad',
+      app: context.entryPointConversionApp || 'facebook/instagram',
+      adTitle: context.externalAdReply?.title || '',
+      adBody: context.externalAdReply?.body || '',
+      campaignId: context.smbServerCampaignId || context.smbClientCampaignId || '',
+      hasCtwaPayload: hasCtwa
+    };
+  }
+
+  return null;
+}
+
 // Iniciar conexión Baileys
 async function connectToWhatsApp() {
   try {
@@ -48,6 +116,27 @@ async function connectToWhatsApp() {
     });
 
     sock.ev.on('creds.update', saveCreds);
+
+    // Sincronizar libreta de contactos para excluir chats personales (familia, amigos)
+    sock.ev.on('contacts.upsert', (contacts) => {
+      for (const c of contacts) {
+        if (c.id) {
+          const clean = c.id.replace('@s.whatsapp.net', '').replace(/:\d+/, '');
+          savedContacts.add(clean);
+        }
+      }
+      console.log(`[Contactos] Agenda sincronizada: ${savedContacts.size} contactos personales identificados.`);
+    });
+
+    sock.ev.on('contacts.update', (updates) => {
+      for (const u of updates) {
+        if (u.id) {
+          const clean = u.id.replace('@s.whatsapp.net', '').replace(/:\d+/, '');
+          savedContacts.add(clean);
+        }
+      }
+    });
+
 
     sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update;
@@ -104,7 +193,7 @@ async function connectToWhatsApp() {
         if (isGroup) continue; // Por ahora solo chats directos (leads)
 
         const pushName = msg.pushName || 'Desconocido';
-        const senderPhone = senderJid?.replace('@s.whatsapp.net', '') || '';
+        const senderPhone = senderJid?.replace('@s.whatsapp.net', '').replace(/:\d+/, '') || '';
 
         // Extraer texto del mensaje
         const text =
@@ -114,26 +203,44 @@ async function connectToWhatsApp() {
           msg.message?.videoMessage?.caption ||
           '[Mensaje multimedia o sin texto directo]';
 
+        // FILTRO 1: Descartar contactos guardados en tu agenda (padre, familiares, amigos)
+        if (savedContacts.has(senderPhone)) {
+          console.log(`\n⛔ [FILTRO AGENDA] Mensaje de contacto personal (+ ${senderPhone} - "${pushName}"). Descartado.`);
+          continue;
+        }
+
+        // FILTRO 2: Detectar metadatos nativos de anuncios de Meta (CTWA)
+        const adInfo = extractMetaAdInfo(msg);
+
+        if (ONLY_META_ADS && !adInfo) {
+          console.log(`\n⛔ [FILTRO NO-PUBLICIDAD] Mensaje de +${senderPhone} ("${pushName}") no contiene metadatos de anuncio de Meta. Descartado.`);
+          continue;
+        }
+
+        console.log(`\n🎯 [LEAD META ADS DETECTADO]`);
+        console.log(`👤 Prospecto: ${pushName} (+${senderPhone})`);
+        if (adInfo) {
+          console.log(`📢 Fuente: ${adInfo.source} | App: ${adInfo.app}`);
+          if (adInfo.adTitle) console.log(`📌 Anuncio: "${adInfo.adTitle}"`);
+          if (adInfo.campaignId) console.log(`🆔 Campaña: ${adInfo.campaignId}`);
+        }
+        console.log(`💬 Mensaje: "${text}"`);
+
         const leadPayload = {
           name: pushName,
           phone: senderPhone,
           message: text,
           event: 'whatsapp_lead_received',
+          adInfo: adInfo || null,
+          source: 'meta_ads_ctwa',
+          service: adInfo?.adTitle ? `Meta Ad: ${adInfo.adTitle}` : 'Meta Ads WhatsApp Lead',
           sender: {
             phone: senderPhone,
             name: pushName,
             jid: senderJid
           },
-          message: {
-            text: text,
-            timestamp: msg.messageTimestamp,
-            id: msg.key.id
-          },
           receivedAt: new Date().toISOString()
         };
-
-        console.log(`\n📩 [NUEVO LEAD WA] De: ${pushName} (+${senderPhone})`);
-        console.log(`💬 Mensaje: "${text}"`);
 
         // Despachar webhook si está configurado
         if (WEBHOOK_URL) {

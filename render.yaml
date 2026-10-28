@@ -14,5 +14,7 @@ services:
         generateValue: true
       - key: FIREBASE_PROJECT_ID
         value: test-addss
+      - key: ONLY_META_ADS
+        value: "true"
       - key: SESSIONS_DIR
         value: ./sessions
