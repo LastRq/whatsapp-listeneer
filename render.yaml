@@ -12,9 +12,15 @@ services:
         value: https://test-ads-one.vercel.app/api/webhook/whatsapp
       - key: WEBHOOK_SECRET
         generateValue: true
+      - key: ADMIN_KEY
+        generateValue: true
+      - key: SESSION_ENCRYPTION_KEY
+        generateValue: true
       - key: FIREBASE_PROJECT_ID
         value: test-addss
       - key: ONLY_META_ADS
         value: "true"
+      - key: DEBUG
+        value: "false"
       - key: SESSIONS_DIR
         value: ./sessions
