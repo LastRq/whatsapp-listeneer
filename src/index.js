@@ -9,6 +9,7 @@ import qrcodeTerminal from 'qrcode-terminal';
 import QRCode from 'qrcode';
 import dotenv from 'dotenv';
 import fs from 'fs';
+import { useFirestoreAuthState, clearFirestoreSession } from './firestore-auth.js';
 
 dotenv.config();
 
@@ -19,6 +20,7 @@ const PORT = process.env.PORT || 3000;
 const SESSIONS_DIR = process.env.SESSIONS_DIR || './sessions';
 const WEBHOOK_URL = process.env.WEBHOOK_URL || 'https://test-ads-one.vercel.app/api/webhook/whatsapp';
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || '';
+const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || 'test-addss';
 
 // Estado en memoria
 let currentQR = null;
@@ -33,7 +35,7 @@ if (!fs.existsSync(SESSIONS_DIR)) {
 // Iniciar conexión Baileys
 async function connectToWhatsApp() {
   try {
-    const { state, saveCreds } = await useMultiFileAuthState(SESSIONS_DIR);
+    const { state, saveCreds } = await useFirestoreAuthState(SESSIONS_DIR, FIREBASE_PROJECT_ID);
     const { version, isLatest } = await fetchLatestBaileysVersion();
     console.log(`[WA] Usando Baileys v${version.join('.')}, última versión: ${isLatest}`);
 
@@ -75,6 +77,8 @@ async function connectToWhatsApp() {
           setTimeout(connectToWhatsApp, delay);
         } else {
           connectionStatus = 'desconectado_logout';
+          await clearFirestoreSession(FIREBASE_PROJECT_ID);
+          if (fs.existsSync(SESSIONS_DIR)) { fs.rmSync(SESSIONS_DIR, { recursive: true, force: true }); }
           console.log('[WA] Sesión cerrada permanentemente (logout). Limpia la carpeta sessions para reintentar.');
         }
       } else if (connection === 'open') {
@@ -251,6 +255,20 @@ app.get('/qr', async (req, res) => {
 });
 
 // JSON Status para que Kindev Meta Ads consulte si está online
+app.post('/api/session/reset', async (req, res) => {
+  try {
+    await clearFirestoreSession(FIREBASE_PROJECT_ID);
+    if (fs.existsSync(SESSIONS_DIR)) {
+      fs.rmSync(SESSIONS_DIR, { recursive: true, force: true });
+    }
+    connectionStatus = 'reiniciando_sesion';
+    setTimeout(connectToWhatsApp, 1500);
+    res.json({ success: true, message: 'Sesión eliminada de Firestore y reiniciando...' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/api/status', (req, res) => {
   res.json({
     status: connectionStatus,
