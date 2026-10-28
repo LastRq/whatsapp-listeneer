@@ -17,7 +17,7 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 const SESSIONS_DIR = process.env.SESSIONS_DIR || './sessions';
-const WEBHOOK_URL = process.env.WEBHOOK_URL;
+const WEBHOOK_URL = process.env.WEBHOOK_URL || 'https://test-ads-one.vercel.app/api/webhook/whatsapp';
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || '';
 
 // Estado en memoria
@@ -111,6 +111,9 @@ async function connectToWhatsApp() {
           '[Mensaje multimedia o sin texto directo]';
 
         const leadPayload = {
+          name: pushName,
+          phone: senderPhone,
+          message: text,
           event: 'whatsapp_lead_received',
           sender: {
             phone: senderPhone,
