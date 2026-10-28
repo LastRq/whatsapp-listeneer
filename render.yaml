@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: whatsapp-listener
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: WEBHOOK_URL
+        sync: false
+      - key: WEBHOOK_SECRET
+        generateValue: true
+      - key: SESSIONS_DIR
+        value: ./sessions
