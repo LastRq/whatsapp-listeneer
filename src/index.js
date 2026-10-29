@@ -60,10 +60,10 @@ app.use((req, res, next) => {
 // Variables de entorno y configuración
 const PORT = process.env.PORT || 3000;
 const SESSIONS_DIR = process.env.SESSIONS_DIR || './sessions';
-const WEBHOOK_URL = process.env.WEBHOOK_URL || 'https://test-ads-one.vercel.app/api/webhook/whatsapp';
+const WEBHOOK_URL = process.env.WEBHOOK_URL || '';
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || '';
 const ADMIN_KEY = process.env.ADMIN_KEY || process.env.WEBHOOK_SECRET || 'kindev_admin_vault_2026';
-const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || 'test-addss';
+const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || '';
 const ONLY_META_ADS = process.env.ONLY_META_ADS !== 'false';
 const IS_DEBUG = process.env.DEBUG === 'true';
 

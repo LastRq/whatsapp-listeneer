@@ -9,7 +9,7 @@ services:
       - key: PORT
         value: 10000
       - key: WEBHOOK_URL
-        value: https://test-ads-one.vercel.app/api/webhook/whatsapp
+        sync: false
       - key: WEBHOOK_SECRET
         generateValue: true
       - key: ADMIN_KEY
@@ -17,7 +17,7 @@ services:
       - key: SESSION_ENCRYPTION_KEY
         generateValue: true
       - key: FIREBASE_PROJECT_ID
-        value: test-addss
+        sync: false
       - key: ONLY_META_ADS
         value: "true"
       - key: DEBUG

@@ -64,7 +64,16 @@ function getEncryptionKey(explicitKey) {
 /**
  * Descarga las credenciales guardadas en Firestore, las descifra y las restaura en disco local.
  */
-export async function restoreSessionFromFirestore(folder, projectId = 'test-addss', encryptionKey = null) {
+export async function restoreSessionFromFirestore(
+  folder,
+  projectId = process.env.FIREBASE_PROJECT_ID,
+  encryptionKey = null
+) {
+  if (!projectId) {
+    console.log('[Firestore Auth] ℹ️ FIREBASE_PROJECT_ID no configurado. Operando con almacenamiento local.');
+    return false;
+  }
+
   try {
     if (!fs.existsSync(folder)) {
       fs.mkdirSync(folder, { recursive: true });
@@ -118,7 +127,14 @@ export async function restoreSessionFromFirestore(folder, projectId = 'test-adds
 /**
  * Cifra y guarda un archivo de sesión en Firestore de forma asíncrona.
  */
-export async function saveFileToFirestore(fileName, rawData, projectId = 'test-addss', encryptionKey = null) {
+export async function saveFileToFirestore(
+  fileName,
+  rawData,
+  projectId = process.env.FIREBASE_PROJECT_ID,
+  encryptionKey = null
+) {
+  if (!projectId) return;
+
   try {
     const docId = toDocId(fileName);
     const url = `${FIRESTORE_BASE_URL(projectId)}/${docId}`;
@@ -145,7 +161,12 @@ export async function saveFileToFirestore(fileName, rawData, projectId = 'test-a
 /**
  * Elimina un archivo de sesión en Firestore cuando Baileys lo borra.
  */
-export async function removeFileFromFirestore(fileName, projectId = 'test-addss') {
+export async function removeFileFromFirestore(
+  fileName,
+  projectId = process.env.FIREBASE_PROJECT_ID
+) {
+  if (!projectId) return;
+
   try {
     const docId = toDocId(fileName);
     const url = `${FIRESTORE_BASE_URL(projectId)}/${docId}`;
@@ -158,7 +179,11 @@ export async function removeFileFromFirestore(fileName, projectId = 'test-addss'
 /**
  * Borra toda la sesión almacenada en Firestore.
  */
-export async function clearFirestoreSession(projectId = 'test-addss') {
+export async function clearFirestoreSession(
+  projectId = process.env.FIREBASE_PROJECT_ID
+) {
+  if (!projectId) return;
+
   try {
     const res = await fetch(`${FIRESTORE_BASE_URL(projectId)}?pageSize=300`);
     if (!res.ok) return;
@@ -178,16 +203,23 @@ export async function clearFirestoreSession(projectId = 'test-addss') {
 /**
  * Adaptador híbrido de Baileys con persistencia cifrada en Firestore + caché local.
  */
-export async function useFirestoreAuthState(folder, projectId = 'test-addss', encryptionKey = null) {
-  // 1. Restaurar y descifrar desde Firestore si no hay archivos locales
-  await restoreSessionFromFirestore(folder, projectId, encryptionKey);
+export async function useFirestoreAuthState(
+  folder,
+  projectId = process.env.FIREBASE_PROJECT_ID,
+  encryptionKey = null
+) {
+  // 1. Restaurar y descifrar desde Firestore si está configurado y no hay archivos locales
+  if (projectId) {
+    await restoreSessionFromFirestore(folder, projectId, encryptionKey);
+  }
 
   // 2. Usar multi-file auth state local
   const { state, saveCreds: originalSaveCreds } = await useMultiFileAuthState(folder);
 
-  // 3. Extender saveCreds para cifrar y sincronizar en Firestore
+  // 3. Extender saveCreds para cifrar y sincronizar en Firestore si hay projectId
   const saveCreds = async () => {
     await originalSaveCreds();
+    if (!projectId) return;
     const credsPath = path.join(folder, 'creds.json');
     if (fs.existsSync(credsPath)) {
       const content = fs.readFileSync(credsPath, 'utf8');
@@ -195,10 +227,11 @@ export async function useFirestoreAuthState(folder, projectId = 'test-addss', en
     }
   };
 
-  // 4. Interceptar keys.set para cifrar y sincronizar keys en Firestore
+  // 4. Interceptar keys.set para cifrar y sincronizar keys en Firestore si hay projectId
   const originalKeysSet = state.keys.set;
   state.keys.set = async (data) => {
     await originalKeysSet(data);
+    if (!projectId) return;
     for (const category in data) {
       for (const id in data[category]) {
         const value = data[category][id];
