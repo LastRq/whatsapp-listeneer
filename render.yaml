@@ -9,7 +9,7 @@ services:
       - key: PORT
         value: 10000
       - key: WEBHOOK_URL
-        sync: false
+        value: https://kindevmetaads.web.app/api/webhook/whatsapp
       - key: WEBHOOK_SECRET
         generateValue: true
       - key: ADMIN_KEY
@@ -17,7 +17,7 @@ services:
       - key: SESSION_ENCRYPTION_KEY
         generateValue: true
       - key: FIREBASE_PROJECT_ID
-        sync: false
+        value: kindevmetaads
       - key: ONLY_META_ADS
         value: "true"
       - key: DEBUG

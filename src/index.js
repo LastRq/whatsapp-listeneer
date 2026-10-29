@@ -57,13 +57,13 @@ app.use((req, res, next) => {
   next();
 });
 
-// Variables de entorno y configuración
+// Variables de entorno y configuración (Defaults optimizados para Kindev Meta Ads)
 const PORT = process.env.PORT || 3000;
 const SESSIONS_DIR = process.env.SESSIONS_DIR || './sessions';
-const WEBHOOK_URL = process.env.WEBHOOK_URL || '';
+const WEBHOOK_URL = process.env.WEBHOOK_URL || 'https://kindevmetaads.web.app/api/webhook/whatsapp';
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || '';
 const ADMIN_KEY = process.env.ADMIN_KEY || process.env.WEBHOOK_SECRET || 'kindev_admin_vault_2026';
-const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || '';
+const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || 'kindevmetaads';
 const ONLY_META_ADS = process.env.ONLY_META_ADS !== 'false';
 const IS_DEBUG = process.env.DEBUG === 'true';
 
@@ -126,21 +126,22 @@ function requireAdminAuth(req, res, next) {
 
 /**
  * Extrae y valida metadatos nativos de anuncios de Meta (Click-to-WhatsApp Ads / CTWA)
+ * Soporta de manera recursiva mensajes de texto, audios/notas de voz, imágenes, videos y documentos.
  */
 function extractMetaAdInfo(msg) {
   const m = msg.message;
   if (!m) return null;
 
-  const context =
-    m.extendedTextMessage?.contextInfo ||
-    m.imageMessage?.contextInfo ||
-    m.videoMessage?.contextInfo ||
-    m.documentMessage?.contextInfo ||
-    m.buttonsResponseMessage?.contextInfo ||
-    m.templateButtonReplyMessage?.contextInfo ||
-    m.interactiveResponseMessage?.contextInfo ||
-    m.contextInfo ||
-    null;
+  // Inspección recursiva de contextInfo en cualquier tipo de mensaje (audio, texto, multimedia)
+  let context = m.contextInfo;
+  if (!context) {
+    for (const key of Object.keys(m)) {
+      if (m[key] && typeof m[key] === 'object' && m[key].contextInfo) {
+        context = m[key].contextInfo;
+        break;
+      }
+    }
+  }
 
   if (!context) return null;
 
@@ -179,6 +180,46 @@ function extractMetaAdInfo(msg) {
   return null;
 }
 
+/**
+ * Guarda el lead de Meta Ads directamente en Cloud Firestore (Kindev Meta Ads)
+ */
+async function saveLeadDirectToFirestore(projectId, payload) {
+  if (!projectId) return false;
+  try {
+    const url = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/leads`;
+    const cleanPh = String(payload.phone || '').replace(/\D/g, '');
+    const firestoreBody = {
+      fields: {
+        name: { stringValue: String(payload.name || 'Cliente WhatsApp').substring(0, 100) },
+        phone: { stringValue: cleanPh.substring(0, 20) },
+        displayPhone: { stringValue: `+${cleanPh}` },
+        service: { stringValue: String(payload.service || 'Contacto Meta Ads').substring(0, 100) },
+        notes: { stringValue: String(payload.message || '').substring(0, 500) },
+        status: { stringValue: 'prospecto' },
+        amount: { doubleValue: 0 },
+        createdAt: { stringValue: payload.receivedAt || new Date().toISOString() },
+        source: { stringValue: 'whatsapp_auto' },
+        tenantId: { stringValue: 'kindev' },
+        eventId: { stringValue: `wa_${cleanPh}_${Date.now()}` }
+      }
+    };
+
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(firestoreBody)
+    });
+
+    if (res.ok) {
+      console.log(`⚡ [FIRESTORE SYNC] Lead ingresado directamente a Cloud Firestore (${projectId}).`);
+      return true;
+    }
+  } catch (err) {
+    console.error(`⚠️ [FIRESTORE SYNC] Error guardando lead en ${projectId}:`, err.message);
+  }
+  return false;
+}
+
 // ================= MOTOR BAILEYS =================
 
 async function connectToWhatsApp() {
@@ -192,7 +233,7 @@ async function connectToWhatsApp() {
       auth: state,
       logger: pino({ level: 'silent' }),
       printQRInTerminal: false,
-      browser: ['Kindev Shield', 'Chrome', '1.0.0']
+      browser: ['Kindev Meta Ads', 'Chrome', '1.0.0']
     });
 
     sock.ev.on('creds.update', saveCreds);
@@ -276,13 +317,35 @@ async function connectToWhatsApp() {
         const pushName = msg.pushName || 'Desconocido';
         const senderPhone = senderJid?.replace('@s.whatsapp.net', '').replace(/:\d+/, '') || '';
 
-        // Extraer texto del mensaje
-        const text =
-          msg.message?.conversation ||
-          msg.message?.extendedTextMessage?.text ||
-          msg.message?.imageMessage?.caption ||
-          msg.message?.videoMessage?.caption ||
-          '[Mensaje multimedia o sin texto directo]';
+        // Extraer texto o identificar audios/notas de voz y multimedia
+        let text = '';
+        let mediaType = 'text';
+
+        if (msg.message?.conversation) {
+          text = msg.message.conversation;
+        } else if (msg.message?.extendedTextMessage?.text) {
+          text = msg.message.extendedTextMessage.text;
+        } else if (msg.message?.audioMessage) {
+          mediaType = 'audio';
+          const isPtt = Boolean(msg.message.audioMessage.ptt);
+          const seconds = msg.message.audioMessage.seconds || 0;
+          text = isPtt ? `[🎤 Nota de voz (${seconds}s)]` : `[🎵 Audio (${seconds}s)]`;
+        } else if (msg.message?.imageMessage) {
+          mediaType = 'image';
+          text = msg.message.imageMessage.caption
+            ? `[📷 Imagen]: ${msg.message.imageMessage.caption}`
+            : '[📷 Imagen recibida]';
+        } else if (msg.message?.videoMessage) {
+          mediaType = 'video';
+          text = msg.message.videoMessage.caption
+            ? `[🎥 Video]: ${msg.message.videoMessage.caption}`
+            : '[🎥 Video recibido]';
+        } else if (msg.message?.documentMessage) {
+          mediaType = 'document';
+          text = `[📄 Documento: ${msg.message.documentMessage.fileName || 'archivo'}]`;
+        } else {
+          text = '[Mensaje multimedia o sin texto directo]';
+        }
 
         // FILTRO 1: Descartar contactos de agenda personal
         if (savedContacts.has(senderPhone)) {
@@ -308,7 +371,7 @@ async function connectToWhatsApp() {
         if (IS_DEBUG) {
           console.log(`💬 Mensaje (DEBUG): "${text}"`);
         } else {
-          console.log(`💬 Mensaje: [${text.length} caracteres - Contenido protegido por privacidad]`);
+          console.log(`💬 Contenido: ${mediaType === 'audio' ? text : `[${text.length} caracteres - Protegido por privacidad]`}`);
         }
 
         const leadPayload = {
@@ -317,6 +380,7 @@ async function connectToWhatsApp() {
           message: text,
           event: 'whatsapp_lead_received',
           adInfo: adInfo || null,
+          mediaType,
           source: 'meta_ads_ctwa',
           service: adInfo?.adTitle ? `Meta Ad: ${adInfo.adTitle}` : 'Meta Ads WhatsApp Lead',
           sender: {
@@ -327,7 +391,10 @@ async function connectToWhatsApp() {
           receivedAt: new Date().toISOString()
         };
 
-        // Despachar webhook con firma criptográfica HMAC-SHA256
+        // 1. Inserción directa en Cloud Firestore (Kindev Meta Ads) para sincronización en tiempo real
+        await saveLeadDirectToFirestore(FIREBASE_PROJECT_ID, leadPayload);
+
+        // 2. Despachar webhook HTTP firmado con HMAC-SHA256
         if (WEBHOOK_URL) {
           try {
             const rawBody = JSON.stringify(leadPayload);
@@ -401,7 +468,7 @@ app.get('/', (req, res) => {
             Destino Webhook: <code>${isAdmin ? WEBHOOK_URL : 'https://[Protegido en Producción]'}</code>
           </p>
           <p style="font-size: 12px; color: #64748b;">
-            Filtro publicitario: <strong>${ONLY_META_ADS ? 'Meta Ads Exclusivo (CTWA)' : 'Todos los chats'}</strong>
+            Filtro publicitario: <strong>${ONLY_META_ADS ? 'Meta Ads Exclusivo (CTWA + Audios)' : 'Todos los chats'}</strong>
           </p>
         </div>
       </body>
@@ -456,7 +523,7 @@ app.get('/qr', requireAdminAuth, async (req, res) => {
           <div class="box">
             <img src="${qrDataUrl}" alt="WhatsApp QR Code" />
           </div>
-          <p style="font-size: 12px; color: #94a3b8; margin-top: 20px;">Sesión protegida con cifrado AES-256 en Firestore.</p>
+          <p style="font-size: 12px; color: #94a3b8; margin-top: 20px;">Sesión protegida con cifrado AES-256 en Firestore (kindevmetaads).</p>
         </body>
       </html>
     `);
@@ -488,11 +555,12 @@ app.get('/api/status', (req, res) => {
     connected: Boolean(connectedUser),
     hasQR: Boolean(currentQR),
     phone: isAdmin ? connectedUser?.id : (connectedUser ? maskPhone(connectedUser.id?.split(':')[0]) : null),
-    filterActive: ONLY_META_ADS
+    filterActive: ONLY_META_ADS,
+    projectId: FIREBASE_PROJECT_ID
   });
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 [SERVER] Servidor blindado corriendo en puerto ${PORT}`);
+  console.log(`🚀 [SERVER] Servidor blindado corriendo en puerto ${PORT} para Kindev Meta Ads`);
   connectToWhatsApp();
 });

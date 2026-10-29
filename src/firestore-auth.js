@@ -7,7 +7,8 @@ const FIRESTORE_BASE_URL = (projectId) =>
   `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/settings`;
 
 function toDocId(fileName) {
-  return 'whatsapp_session_' + fileName.replace(/[^a-zA-Z0-9_-]/g, '_');
+  // Prefijo 'whatsapp_status_session_' compatible nativamente con las reglas de Firestore de Kindev Meta Ads
+  return 'whatsapp_status_session_' + fileName.replace(/[^a-zA-Z0-9_-]/g, '_');
 }
 
 /**
@@ -94,9 +95,10 @@ export async function restoreSessionFromFirestore(
     }
 
     const data = await res.json();
-    const docs = (data.documents || []).filter((d) =>
-      d.name.split('/').pop().startsWith('whatsapp_session_')
-    );
+    const docs = (data.documents || []).filter((d) => {
+      const docName = d.name.split('/').pop();
+      return docName.startsWith('whatsapp_status_session_') || docName.startsWith('whatsapp_session_');
+    });
 
     if (docs.length === 0) {
       console.log('[Firestore Auth] ℹ️ No hay sesión previa guardada en Firestore. Se generará un nuevo QR.');
@@ -188,9 +190,10 @@ export async function clearFirestoreSession(
     const res = await fetch(`${FIRESTORE_BASE_URL(projectId)}?pageSize=300`);
     if (!res.ok) return;
     const data = await res.json();
-    const docs = (data.documents || []).filter((d) =>
-      d.name.split('/').pop().startsWith('whatsapp_session_')
-    );
+    const docs = (data.documents || []).filter((d) => {
+      const docName = d.name.split('/').pop();
+      return docName.startsWith('whatsapp_status_session_') || docName.startsWith('whatsapp_session_');
+    });
     await Promise.all(
       docs.map((doc) => fetch(`https://firestore.googleapis.com/v1/${doc.name}`, { method: 'DELETE' }))
     );
