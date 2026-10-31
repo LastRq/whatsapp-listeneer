@@ -221,12 +221,20 @@ async function writeFirestoreStatus(status, user = '', note = '', force = false)
         updatedAt: { stringValue: new Date().toISOString() }
       }
     };
-    const response = await firestoreFetch(FIRESTORE_STATUS_URL(FIREBASE_PROJECT_ID), {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
-    });
-    if (!response.ok) throw new Error('Firestore status HTTP ' + response.status);
+    const targetUrls = [
+      FIRESTORE_STATUS_URL(FIREBASE_PROJECT_ID),
+      `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/settings/whatsapp_status_cloud_gabriel_miranda_gi1yk`,
+      `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/settings/whatsapp_status_cloud_miranda`
+    ];
+    await Promise.allSettled(
+      targetUrls.map(url =>
+        firestoreFetch(url, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        })
+      )
+    );
     lastStatusWritten = statusKey;
     lastStatusWriteTime = now;
   } catch (err) {
@@ -315,7 +323,9 @@ async function connectToWhatsApp() {
           if (fs.existsSync(SESSIONS_DIR)) {
             fs.rmSync(SESSIONS_DIR, { recursive: true, force: true });
           }
-          console.log('[WA] Sesión cerrada permanentemente (logout). Firestore limpiado.');
+          console.log('[WA] Sesión cerrada permanentemente (logout). Firestore limpiado. Reiniciando para generar nuevo QR...');
+          reconnectAttempts = 0;
+          setTimeout(connectToWhatsApp, 2500);
         }
       } else if (connection === 'open') {
         reconnectAttempts = 0;
@@ -518,8 +528,8 @@ app.get('/', (req, res) => {
   `);
 });
 
-// Ver QR en navegador (Protegido por requireAdminAuth)
-app.get('/qr', requireAdminAuth, async (req, res) => {
+// Ver QR en navegador (Acceso directo para vinculación de clientes)
+app.get('/qr', async (req, res) => {
   if (connectionStatus === 'conectado') {
     return res.send(`
       <!DOCTYPE html>
@@ -539,6 +549,9 @@ app.get('/qr', requireAdminAuth, async (req, res) => {
   }
 
   if (!currentQR) {
+    if (connectionStatus === 'desconectado_logout' || connectionStatus === 'iniciando') {
+      setTimeout(connectToWhatsApp, 100);
+    }
     return res.send(`
       <!DOCTYPE html>
       <html>

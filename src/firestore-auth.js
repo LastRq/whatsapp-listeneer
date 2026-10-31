@@ -212,7 +212,7 @@ export async function clearFirestoreSession(
   try {
     const docs = await listSessionDocuments(projectId);
     await Promise.all(
-      docs.map((doc) => fetch(`https://firestore.googleapis.com/v1/${doc.name}`, { method: 'DELETE' }))
+      docs.map((doc) => firestoreFetch(`https://firestore.googleapis.com/v1/${doc.name}`, { method: 'DELETE' }))
     );
     console.log(`[Firestore Auth] 🗑️ Sesión eliminada de Firestore.`);
   } catch (err) {

@@ -39,13 +39,18 @@ export async function saveWhatsAppLead(payload) {
     if (ctwaClid && !existing.ctwaClid) await patchDocument('leads/' + existing.id, { ctwaClid });
     return { id: existing.id, created: false };
   }
-  const id = 'wa_' + crypto.createHash('sha256').update(TENANT_ID + ':' + phone).digest('hex').slice(0, 40);
+  const msgText = String(payload.message || '').toLowerCase();
+  const isMirandaMsg = msgText.includes('50') || msgText.includes('dental') || msgText.includes('diente') || msgText.includes('ortodoncia') || msgText.includes('limpieza') || msgText.includes('profilaxis') || msgText.includes('odontol') || msgText.includes('miranda') || msgText.includes('gabriel');
+  const effectiveTenant = isMirandaMsg ? 'gabriel_miranda_gi1yk' : TENANT_ID;
+  const effectiveService = isMirandaMsg ? 'Promoción Campaña ($50 USD)' : String(payload.service || 'Contacto Meta Ads').slice(0, 100);
+
+  const id = 'wa_' + crypto.createHash('sha256').update(effectiveTenant + ':' + phone).digest('hex').slice(0, 40);
   const eventId = 'wa_lead_' + id;
   const lead = {
     name: String(payload.name || 'Cliente WhatsApp').slice(0, 100), phone, displayPhone: '+' + phone,
-    service: String(payload.service || 'Contacto Meta Ads').slice(0, 100), notes: String(payload.message || '').slice(0, 500),
+    service: effectiveService, notes: String(payload.message || '').slice(0, 500),
     status: 'prospecto', amount: 0, createdAt: payload.receivedAt || new Date().toISOString(),
-    source: 'whatsapp_auto', tenantId: TENANT_ID, eventId, metaEvents: [], ...(ctwaClid ? { ctwaClid } : {}),
+    source: 'whatsapp_auto', tenantId: effectiveTenant, eventId, metaEvents: [], ...(ctwaClid ? { ctwaClid } : {}),
     metaDelivery: { status: 'pending', eventId }
   };
   try { await patchDocument('leads/' + id, lead, false); }
