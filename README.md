@@ -49,3 +49,13 @@ node --check src/index.js
 ```
 
 El despliegue se comprueba con /api/status: debe indicar `projectId: kindevads`, el tenant esperado y la versión `kindevads-tenants-1`. Un servidor que responde HTTP 200 no implica por sí solo que WhatsApp esté conectado.
+
+## Integraciones oficiales de Meta
+
+El servicio incluye una pasarela CAPI/Insights para la plataforma kindevads.com. Cada ruta /api/meta/TENANT utiliza exclusivamente la configuración de ese tenant en Firebase kindevads; requiere X-Meta-Token igual a su credencial registrada. Kindev separa capiToken de userToken/marketingToken. No hay credenciales globales de cliente ni fallback a otro tenant.
+
+Los nuevos leads de la instancia se guardan antes de enviarse a CAPI. Los envíos pendientes conservan event_id y event_time y se reintentan cada 30 minutos; el histórico sin marca pending no se reenvía. CTWA se conserva si Baileys entrega externalAdReply.ctwaClid. Page ID/WABA se configuran en la plataforma. Nunca se inventan identificadores del visitante ni se incluyen notas clínicas en custom_data.
+
+Seguimiento observa únicamente contactos existentes en el CRM del tenant de esta instancia y persiste fechas/respuestas en sus leads. GET /api/whatsapp/outbound-tracker-full está protegido por su credencial de cuenta. No habilita envíos automáticos ni expone chats personales.
+
+Los tokens permanecen en el registro Firebase ya existente y se leen desde el frontend autenticado para probar posesión ante la pasarela. Esto no sustituye una futura autorización de Firestore por membresías; las reglas y el login de la plataforma requieren su propia migración de seguridad.

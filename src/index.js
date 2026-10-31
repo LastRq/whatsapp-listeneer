@@ -13,6 +13,10 @@ import fs from 'fs';
 import path from 'path';
 import { FIREBASE_PROJECT_ID, TENANT_ID, firestoreFetch } from './firebase-client.js';
 import { statusCors, publicListenerStatus } from './http-status.js';
+import { installMetaRoutes } from './meta-integration.js';
+import { extractMetaAdInfo } from './meta-ad-info.js';
+import { installOutboundRoutes, observeCrmConversation } from './outbound-tracker.js';
+import { saveWhatsAppLead, retryPendingWhatsAppLeads } from './whatsapp-leads.js';
 import { useFirestoreAuthState, clearFirestoreSession } from './firestore-auth.js';
 
 dotenv.config();
@@ -62,6 +66,11 @@ app.use((req, res, next) => {
 
   next();
 });
+
+installMetaRoutes(app);
+installOutboundRoutes(app);
+setInterval(retryPendingWhatsAppLeads, 30 * 60 * 1000).unref();
+retryPendingWhatsAppLeads();
 
 // Variables de entorno y configuración (Defaults optimizados para Kindev Meta Ads)
 const PORT = process.env.PORT || 3000;
@@ -164,96 +173,14 @@ function requireAdminAuth(req, res, next) {
  * Extrae y valida metadatos nativos de anuncios de Meta (Click-to-WhatsApp Ads / CTWA)
  * Soporta de manera recursiva mensajes de texto, audios/notas de voz, imágenes, videos y documentos.
  */
-function extractMetaAdInfo(msg) {
-  const m = msg.message;
-  if (!m) return null;
-
-  // Inspección recursiva de contextInfo en cualquier tipo de mensaje (audio, texto, multimedia)
-  let context = m.contextInfo;
-  if (!context) {
-    for (const key of Object.keys(m)) {
-      if (m[key] && typeof m[key] === 'object' && m[key].contextInfo) {
-        context = m[key].contextInfo;
-        break;
-      }
-    }
-  }
-
-  if (!context) return null;
-
-  const source = String(context.entryPointConversionSource || '').toLowerCase();
-  const app = String(context.entryPointConversionApp || '').toLowerCase();
-  const extSource = String(context.entryPointConversionExternalSource || '').toLowerCase();
-  const conversionSource = String(context.conversionSource || '').toLowerCase();
-
-  const isMetaSource =
-    source.includes('ad') ||
-    source.includes('ctwa') ||
-    source.includes('fb') ||
-    source.includes('ig') ||
-    source.includes('meta') ||
-    app.includes('facebook') ||
-    app.includes('instagram') ||
-    extSource.includes('ad') ||
-    conversionSource.includes('ad');
-
-  const hasCtwa = Boolean(context.ctwaPayload || context.ctwaSignals);
-  const hasAdReply = Boolean(context.externalAdReply || context.quotedAd);
-  const hasCampaign = Boolean(context.smbServerCampaignId || context.smbClientCampaignId);
-
-  if (isMetaSource || hasCtwa || hasAdReply || hasCampaign) {
-    return {
-      isAd: true,
-      source: context.entryPointConversionSource || context.entryPointConversionApp || 'meta_ad',
-      app: context.entryPointConversionApp || 'facebook/instagram',
-      adTitle: context.externalAdReply?.title || '',
-      adBody: context.externalAdReply?.body || '',
-      campaignId: context.smbServerCampaignId || context.smbClientCampaignId || '',
-      hasCtwaPayload: hasCtwa
-    };
-  }
-
-  return null;
-}
 
 /**
  * Guarda el lead de Meta Ads directamente en Cloud Firestore (Kindev Meta Ads)
  */
 async function saveLeadDirectToFirestore(projectId, payload) {
-  if (!projectId) return false;
-  try {
-    const url = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/leads`;
-    const cleanPh = String(payload.phone || '').replace(/\D/g, '');
-    const firestoreBody = {
-      fields: {
-        name: { stringValue: String(payload.name || 'Cliente WhatsApp').substring(0, 100) },
-        phone: { stringValue: cleanPh.substring(0, 20) },
-        displayPhone: { stringValue: `+${cleanPh}` },
-        service: { stringValue: String(payload.service || 'Contacto Meta Ads').substring(0, 100) },
-        notes: { stringValue: String(payload.message || '').substring(0, 500) },
-        status: { stringValue: 'prospecto' },
-        amount: { doubleValue: 0 },
-        createdAt: { stringValue: payload.receivedAt || new Date().toISOString() },
-        source: { stringValue: 'whatsapp_auto' },
-        tenantId: { stringValue: TENANT_ID },
-        eventId: { stringValue: `wa_${cleanPh}_${Date.now()}` }
-      }
-    };
-
-    const res = await firestoreFetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(firestoreBody)
-    });
-
-    if (res.ok) {
-      console.log(`⚡ [FIRESTORE SYNC] Lead ingresado directamente a Cloud Firestore (${projectId}).`);
-      return true;
-    }
-  } catch (err) {
-    console.error(`⚠️ [FIRESTORE SYNC] Error guardando lead en ${projectId}:`, err.message);
-  }
-  return false;
+  if (projectId !== FIREBASE_PROJECT_ID) throw new Error('Proyecto no oficial.');
+  try { await saveWhatsAppLead(payload); return true; }
+  catch (e) { console.error('[FIRESTORE SYNC]', e.message); return false; }
 }
 
 /**
@@ -408,7 +335,9 @@ async function connectToWhatsApp() {
       if (type !== 'notify') return;
 
       for (const msg of messages) {
-        if (!msg.message || msg.key.fromMe || msg.key.remoteJid === 'status@broadcast') continue;
+        if (!msg.message || msg.key.remoteJid === 'status@broadcast') continue;
+        await observeCrmConversation(msg);
+        if (msg.key.fromMe) continue;
 
         const senderJid = msg.key.remoteJid;
         const isGroup = senderJid?.endsWith('@g.us');

@@ -33,7 +33,7 @@ export function createFirebaseClient({ apiKey = process.env.KINDEVADS_FIREBASE_A
   }
   async function request(url, options = {}) {
     const parsed = new URL(url);
-    if (parsed.origin !== 'https://firestore.googleapis.com' || !parsed.pathname.startsWith('/v1/projects/' + PROJECT_ID + '/databases/(default)/documents/')) {
+    if (parsed.origin !== 'https://firestore.googleapis.com' || !(parsed.pathname.startsWith('/v1/projects/' + PROJECT_ID + '/databases/(default)/documents/') || [':runQuery', ':commit'].some(suffix => parsed.pathname === '/v1/projects/' + PROJECT_ID + '/databases/(default)/documents' + suffix))) {
       throw new Error('The listener only writes and reads the official kindevads project.');
     }
     const run = async () => fetcher(url, {
