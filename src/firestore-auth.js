@@ -143,7 +143,7 @@ export async function saveFileToFirestore(
     const secret = getEncryptionKey(encryptionKey);
     const encryptedData = encryptPayload(rawData, secret);
 
-    await fetch(url, {
+    let response = await fetch(url, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -155,8 +155,26 @@ export async function saveFileToFirestore(
         }
       })
     });
+
+    if (!response.ok) {
+      // Reintento único si el servidor o Firestore responde con error temporal
+      await new Promise((r) => setTimeout(r, 500));
+      await fetch(url, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          fields: {
+            fileName: { stringValue: fileName },
+            data: { stringValue: encryptedData },
+            encrypted: { booleanValue: true },
+            updatedAt: { stringValue: new Date().toISOString() }
+          }
+        })
+      });
+    }
   } catch (err) {
-    console.error(`[Firestore Auth] ❌ Error sincronizando ${fileName} en Firestore:`, err.message);
+    const detail = err.cause?.message || err.message;
+    console.error(`[Firestore Auth] ❌ Error sincronizando ${fileName} en Firestore:`, detail);
   }
 }
 
@@ -203,6 +221,32 @@ export async function clearFirestoreSession(
   }
 }
 
+// Cola de sincronización secuencial con espaciado para evitar saturación de red en Render
+const syncQueue = [];
+let isQueueRunning = false;
+
+function enqueueSync(task) {
+  syncQueue.push(task);
+  runQueue();
+}
+
+async function runQueue() {
+  if (isQueueRunning) return;
+  isQueueRunning = true;
+  while (syncQueue.length > 0) {
+    const task = syncQueue.shift();
+    try {
+      await task();
+    } catch {
+      // Ignorar errores individuales no capturados
+    }
+    if (syncQueue.length > 0) {
+      await new Promise((r) => setTimeout(r, 40));
+    }
+  }
+  isQueueRunning = false;
+}
+
 /**
  * Adaptador híbrido de Baileys con persistencia cifrada en Firestore + caché local.
  */
@@ -226,7 +270,7 @@ export async function useFirestoreAuthState(
     const credsPath = path.join(folder, 'creds.json');
     if (fs.existsSync(credsPath)) {
       const content = fs.readFileSync(credsPath, 'utf8');
-      saveFileToFirestore('creds.json', content, projectId, encryptionKey);
+      enqueueSync(() => saveFileToFirestore('creds.json', content, projectId, encryptionKey));
     }
   };
 
@@ -243,10 +287,10 @@ export async function useFirestoreAuthState(
           const filePath = path.join(folder, fileName.replace(/\//g, '__').replace(/:/g, '-'));
           if (fs.existsSync(filePath)) {
             const content = fs.readFileSync(filePath, 'utf8');
-            saveFileToFirestore(fileName, content, projectId, encryptionKey);
+            enqueueSync(() => saveFileToFirestore(fileName, content, projectId, encryptionKey));
           }
         } else {
-          removeFileFromFirestore(fileName, projectId);
+          enqueueSync(() => removeFileFromFirestore(fileName, projectId));
         }
       }
     }

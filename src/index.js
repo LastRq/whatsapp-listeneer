@@ -24,6 +24,7 @@ app.use(
 );
 
 app.use(express.json());
+app.use(express.static('public'));
 
 // 2. Rate Limiting en memoria para mitigar saturación y DoS
 const rateLimitMap = new Map();
@@ -128,6 +129,8 @@ function requireAdminAuth(req, res, next) {
       <html>
         <head>
           <title>🔒 Acceso Administrativo Protegido</title>
+          <link rel="icon" type="image/png" href="/favicon.png">
+          <link rel="shortcut icon" href="/favicon.ico">
           <meta name="viewport" content="width=device-width, initial-scale=1.0">
           <style>
             body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #f8fafc; text-align: center; padding: 60px 20px; margin: 0; }
@@ -140,6 +143,7 @@ function requireAdminAuth(req, res, next) {
         </head>
         <body>
           <div class="card">
+            <img src="/logo.png" alt="Kindev Logo" style="width: 60px; height: auto; margin-bottom: 12px; border-radius: 8px;" />
             <h2 style="margin-top: 0;">🔒 Acceso Administrativo</h2>
             <p style="color: #94a3b8; font-size: 14px;">Ingresa la clave de administración para acceder al código QR de WhatsApp.</p>
             <form method="GET" action="/qr">
@@ -256,6 +260,55 @@ async function saveLeadDirectToFirestore(projectId, payload) {
   return false;
 }
 
+/**
+ * Reporta el estado de conexión y heartbeat a Cloud Firestore para Kindev Meta Ads
+ */
+const FIRESTORE_STATUS_URL = (projectId) =>
+  `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/settings/whatsapp_status`;
+
+const HEARTBEAT_INTERVAL_MS = 4 * 60 * 1000;
+let lastStatusWritten = '';
+let lastStatusWriteTime = 0;
+
+async function updateFirestoreStatus(status, user = '', note = '', force = false) {
+  if (!FIREBASE_PROJECT_ID) return;
+  const now = Date.now();
+  const statusKey = `${status}|${user}|${note}`;
+
+  if (!force && statusKey === lastStatusWritten && now - lastStatusWriteTime < HEARTBEAT_INTERVAL_MS) {
+    return;
+  }
+
+  try {
+    const payload = {
+      fields: {
+        status: { stringValue: status },
+        user: { stringValue: user || '' },
+        note: { stringValue: note || '' },
+        isListening: { booleanValue: status === 'connected' },
+        updatedAt: { stringValue: new Date().toISOString() }
+      }
+    };
+    await fetch(FIRESTORE_STATUS_URL(FIREBASE_PROJECT_ID), {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    lastStatusWritten = statusKey;
+    lastStatusWriteTime = now;
+  } catch (err) {
+    // Silencioso para evitar saturación de logs
+  }
+}
+
+// Latido inteligente cada 4 minutos para mantener el estado vivo en el panel de Kindev Ads
+setInterval(() => {
+  if (connectionStatus === 'conectado' && connectedUser) {
+    const rawPhone = connectedUser?.id ? `+${connectedUser.id.split(':')[0].replace(/\D/g, '')}` : '';
+    updateFirestoreStatus('connected', rawPhone, 'Escuchador activo en Render (Kindev Meta Ads)', true);
+  }
+}, HEARTBEAT_INTERVAL_MS);
+
 // ================= MOTOR BAILEYS =================
 
 async function connectToWhatsApp() {
@@ -300,6 +353,7 @@ async function connectToWhatsApp() {
       if (qr) {
         currentQR = qr;
         connectionStatus = 'esperando_qr';
+        updateFirestoreStatus('qr_ready', '', 'Código QR disponible para escanear');
         console.log('\n================ QR DISPONIBLE ================');
         console.log(`Escanea desde WhatsApp ingresando con tu clave a: /qr?key=...`);
         qrcodeTerminal.generate(qr, { small: true });
@@ -318,10 +372,12 @@ async function connectToWhatsApp() {
           reconnectAttempts++;
           const delay = Math.min(reconnectAttempts * 3000, 15000);
           connectionStatus = `reconectando (intento ${reconnectAttempts})`;
+          updateFirestoreStatus('reconnecting', '', `Reconectando intento ${reconnectAttempts}`);
           console.log(`[WA] Reintentando en ${delay / 1000}s...`);
           setTimeout(connectToWhatsApp, delay);
         } else {
           connectionStatus = 'desconectado_logout';
+          updateFirestoreStatus('disconnected', '', 'Sesión cerrada (logout)');
           await clearFirestoreSession(FIREBASE_PROJECT_ID);
           if (fs.existsSync(SESSIONS_DIR)) {
             fs.rmSync(SESSIONS_DIR, { recursive: true, force: true });
@@ -334,8 +390,10 @@ async function connectToWhatsApp() {
         connectionStatus = 'conectado';
         connectedUser = sock.user;
         const masked = maskPhone(sock.user?.id?.split(':')[0]);
+        const rawPhone = sock.user?.id ? `+${sock.user.id.split(':')[0].replace(/\D/g, '')}` : '';
         console.log(`\n🎉 [WA] ¡Conexión establecida con éxito!`);
         console.log(`[WA] Número vinculado: ${masked}\n`);
+        updateFirestoreStatus('connected', rawPhone, 'Escuchador activo en Render (Kindev Meta Ads)', true);
       }
     });
 
@@ -484,6 +542,8 @@ app.get('/', (req, res) => {
     <html>
       <head>
         <title>Kindev WhatsApp Listener</title>
+        <link rel="icon" type="image/png" href="/favicon.png">
+        <link rel="shortcut icon" href="/favicon.ico">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <style>
           body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; padding: 40px 20px; background: #0f172a; color: #f8fafc; }
@@ -499,7 +559,10 @@ app.get('/', (req, res) => {
       </head>
       <body>
         <div class="card">
-          <h2>🛡️ Kindev WhatsApp Gateway</h2>
+          <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 12px;">
+            <img src="/logo.png" alt="Kindev Logo" style="width: 38px; height: 38px; object-fit: contain; border-radius: 6px;" />
+            <h2 style="margin: 0;">Kindev WhatsApp Gateway</h2>
+          </div>
           <p>Estado del servicio: 
             <span class="badge ${connectionStatus === 'conectado' ? 'conectado' : connectionStatus === 'esperando_qr' ? 'esperando_qr' : 'otro'}">
               ${connectionStatus.toUpperCase()}
@@ -526,7 +589,13 @@ app.get('/qr', requireAdminAuth, async (req, res) => {
     return res.send(`
       <!DOCTYPE html>
       <html>
+        <head>
+          <title>WhatsApp Conectado | Kindev</title>
+          <link rel="icon" type="image/png" href="/favicon.png">
+          <link rel="shortcut icon" href="/favicon.ico">
+        </head>
         <body style="font-family: sans-serif; text-align: center; padding: 50px; background: #0f172a; color: white;">
+          <img src="/logo.png" alt="Kindev Logo" style="width: 70px; height: auto; margin-bottom: 16px; border-radius: 8px;" />
           <h2>✅ WhatsApp ya está vinculado y en línea.</h2>
           <p><a href="/" style="color: #38bdf8;">Volver al panel</a></p>
         </body>
@@ -538,8 +607,14 @@ app.get('/qr', requireAdminAuth, async (req, res) => {
     return res.send(`
       <!DOCTYPE html>
       <html>
-        <head><meta http-equiv="refresh" content="3"></head>
+        <head>
+          <title>Generando QR WhatsApp | Kindev</title>
+          <link rel="icon" type="image/png" href="/favicon.png">
+          <link rel="shortcut icon" href="/favicon.ico">
+          <meta http-equiv="refresh" content="3">
+        </head>
         <body style="font-family: sans-serif; text-align: center; padding: 50px; background: #0f172a; color: white;">
+          <img src="/logo.png" alt="Kindev Logo" style="width: 70px; height: auto; margin-bottom: 16px; border-radius: 8px;" />
           <h2>Generando código QR seguro...</h2>
           <p>La página se actualizará automáticamente en unos segundos.</p>
         </body>
@@ -553,19 +628,22 @@ app.get('/qr', requireAdminAuth, async (req, res) => {
       <!DOCTYPE html>
       <html>
         <head>
-          <title>Escanear WhatsApp Seguro</title>
+          <title>Escanear WhatsApp Seguro | Kindev</title>
+          <link rel="icon" type="image/png" href="/favicon.png">
+          <link rel="shortcut icon" href="/favicon.ico">
           <meta http-equiv="refresh" content="15">
           <style>
             body { font-family: sans-serif; text-align: center; padding: 40px; background: #0f172a; color: #f8fafc; }
             .box { background: white; padding: 20px; border-radius: 16px; display: inline-block; margin-top: 20px; }
-            img { width: 280px; height: 280px; }
+            img.qr-img { width: 280px; height: 280px; }
           </style>
         </head>
         <body>
-          <h2>Escanea con tu WhatsApp</h2>
-          <p>Abre WhatsApp > Dispositivos vinculados > Vincular un dispositivo</p>
+          <img src="/logo.png" alt="Kindev Logo" style="width: 70px; height: auto; margin-bottom: 12px; border-radius: 8px;" />
+          <h2 style="margin: 0 0 8px 0;">Escanea con tu WhatsApp</h2>
+          <p style="margin: 0; color: #94a3b8;">Abre WhatsApp > Dispositivos vinculados > Vincular un dispositivo</p>
           <div class="box">
-            <img src="${qrDataUrl}" alt="WhatsApp QR Code" />
+            <img class="qr-img" src="${qrDataUrl}" alt="WhatsApp QR Code" />
           </div>
           <p style="font-size: 12px; color: #94a3b8; margin-top: 20px;">Sesión protegida con cifrado AES-256 en Firestore (kindevmetaads).</p>
         </body>
