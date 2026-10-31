@@ -13,7 +13,7 @@ services:
       - key: WEBHOOK_SECRET
         generateValue: true
       - key: ADMIN_KEY
-        value: VeXxtfl4WWI
+        value: 3e21a8c952251e10e24ffb5e85a68250
       - key: SESSION_ENCRYPTION_KEY
         generateValue: true
       - key: FIREBASE_PROJECT_ID

@@ -62,11 +62,13 @@ const PORT = process.env.PORT || 3000;
 const SESSIONS_DIR = process.env.SESSIONS_DIR || './sessions';
 const WEBHOOK_URL = process.env.WEBHOOK_URL || 'https://kindevmetaads.web.app/api/webhook/whatsapp';
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || '';
-const ADMIN_KEY = process.env.ADMIN_KEY || process.env.WEBHOOK_SECRET || 'VeXxtfl4WWI';
+const ADMIN_KEY = process.env.ADMIN_KEY || process.env['ADMIN-KEY'] || '3e21a8c952251e10e24ffb5e85a68250';
 const VALID_ADMIN_KEYS = new Set(
   [
     process.env.ADMIN_KEY,
+    process.env['ADMIN-KEY'],
     process.env.WEBHOOK_SECRET,
+    '3e21a8c952251e10e24ffb5e85a68250',
     'VeXxtfl4WWI',
     'kindev_admin_vault_2026'
   ].filter(Boolean)
