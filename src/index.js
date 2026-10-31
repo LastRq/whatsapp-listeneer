@@ -10,6 +10,9 @@ import qrcodeTerminal from 'qrcode-terminal';
 import QRCode from 'qrcode';
 import dotenv from 'dotenv';
 import fs from 'fs';
+import path from 'path';
+import { FIREBASE_PROJECT_ID, TENANT_ID, firestoreFetch } from './firebase-client.js';
+import { statusCors, publicListenerStatus } from './http-status.js';
 import { useFirestoreAuthState, clearFirestoreSession } from './firestore-auth.js';
 
 dotenv.config();
@@ -23,6 +26,8 @@ app.use(
   })
 );
 
+// Only public status is readable cross-origin. QR/session actions keep their existing protection.
+app.use(statusCors);
 app.use(express.json());
 app.use(express.static('public'));
 
@@ -60,21 +65,12 @@ app.use((req, res, next) => {
 
 // Variables de entorno y configuración (Defaults optimizados para Kindev Meta Ads)
 const PORT = process.env.PORT || 3000;
-const SESSIONS_DIR = process.env.SESSIONS_DIR || './sessions';
-const WEBHOOK_URL = process.env.WEBHOOK_URL || 'https://kindevmetaads.web.app/api/webhook/whatsapp';
+const SESSIONS_DIR = path.join(process.env.SESSIONS_DIR || './sessions', TENANT_ID);
+const WEBHOOK_URL = process.env.KINDEVADS_WEBHOOK_URL || '';
+if (WEBHOOK_URL && new URL(WEBHOOK_URL).hostname !== 'kindevads.com') throw new Error('Webhooks must target kindevads.com.');
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || '';
-const ADMIN_KEY = process.env.ADMIN_KEY || process.env['ADMIN-KEY'] || '3e21a8c952251e10e24ffb5e85a68250';
-const VALID_ADMIN_KEYS = new Set(
-  [
-    process.env.ADMIN_KEY,
-    process.env['ADMIN-KEY'],
-    process.env.WEBHOOK_SECRET,
-    '3e21a8c952251e10e24ffb5e85a68250',
-    'VeXxtfl4WWI',
-    'kindev_admin_vault_2026'
-  ].filter(Boolean)
-);
-const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || 'kindevmetaads';
+const ADMIN_KEY = process.env.ADMIN_KEY || process.env['ADMIN-KEY'] || '';
+const VALID_ADMIN_KEYS = new Set([ADMIN_KEY].filter(Boolean));
 const ONLY_META_ADS = process.env.ONLY_META_ADS !== 'false';
 const IS_DEBUG = process.env.DEBUG === 'true';
 
@@ -239,12 +235,12 @@ async function saveLeadDirectToFirestore(projectId, payload) {
         amount: { doubleValue: 0 },
         createdAt: { stringValue: payload.receivedAt || new Date().toISOString() },
         source: { stringValue: 'whatsapp_auto' },
-        tenantId: { stringValue: 'kindev' },
+        tenantId: { stringValue: TENANT_ID },
         eventId: { stringValue: `wa_${cleanPh}_${Date.now()}` }
       }
     };
 
-    const res = await fetch(url, {
+    const res = await firestoreFetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(firestoreBody)
@@ -264,7 +260,7 @@ async function saveLeadDirectToFirestore(projectId, payload) {
  * Reporta el estado de conexión y heartbeat a Cloud Firestore para Kindev Meta Ads
  */
 const FIRESTORE_STATUS_URL = (projectId) =>
-  `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/settings/whatsapp_status`;
+  `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/settings/whatsapp_status_${TENANT_ID}`;
 
 const HEARTBEAT_INTERVAL_MS = 4 * 60 * 1000;
 let lastStatusWritten = '';
@@ -282,6 +278,9 @@ async function updateFirestoreStatus(status, user = '', note = '', force = false
   try {
     const payload = {
       fields: {
+        tenantId: { stringValue: TENANT_ID },
+        projectId: { stringValue: FIREBASE_PROJECT_ID },
+        instanceId: { stringValue: process.env.RENDER_SERVICE_ID || TENANT_ID },
         status: { stringValue: status },
         user: { stringValue: user || '' },
         note: { stringValue: note || '' },
@@ -289,15 +288,16 @@ async function updateFirestoreStatus(status, user = '', note = '', force = false
         updatedAt: { stringValue: new Date().toISOString() }
       }
     };
-    await fetch(FIRESTORE_STATUS_URL(FIREBASE_PROJECT_ID), {
+    const response = await firestoreFetch(FIRESTORE_STATUS_URL(FIREBASE_PROJECT_ID), {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
     });
+    if (!response.ok) throw new Error('Firestore status HTTP ' + response.status);
     lastStatusWritten = statusKey;
     lastStatusWriteTime = now;
   } catch (err) {
-    // Silencioso para evitar saturación de logs
+    console.error('[Status] No se pudo actualizar el estado de la cuenta:', err.message);
   }
 }
 
@@ -645,7 +645,7 @@ app.get('/qr', requireAdminAuth, async (req, res) => {
           <div class="box">
             <img class="qr-img" src="${qrDataUrl}" alt="WhatsApp QR Code" />
           </div>
-          <p style="font-size: 12px; color: #94a3b8; margin-top: 20px;">Sesión protegida con cifrado AES-256 en Firestore (kindevmetaads).</p>
+          <p style="font-size: 12px; color: #94a3b8; margin-top: 20px;">Sesión protegida con cifrado AES-256 en Firestore (kindevads).</p>
         </body>
       </html>
     `);
@@ -672,14 +672,14 @@ app.post('/api/session/reset', requireAdminAuth, async (req, res) => {
 // JSON Status (Endpoint seguro que oculta PII a menos que se autentique con key)
 app.get('/api/status', (req, res) => {
   const isAdmin = isValidAdminKey(extractCandidateKey(req));
-  res.json({
+  res.json(publicListenerStatus({
     status: connectionStatus,
-    connected: Boolean(connectedUser),
-    hasQR: Boolean(currentQR),
     phone: isAdmin ? connectedUser?.id : (connectedUser ? maskPhone(connectedUser.id?.split(':')[0]) : null),
-    filterActive: ONLY_META_ADS,
-    projectId: FIREBASE_PROJECT_ID
-  });
+    tenantId: TENANT_ID,
+    projectId: FIREBASE_PROJECT_ID,
+    hasQR: Boolean(currentQR),
+    filterActive: ONLY_META_ADS
+  }));
 });
 
 app.listen(PORT, () => {

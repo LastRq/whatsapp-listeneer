@@ -2,13 +2,26 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { useMultiFileAuthState } from '@whiskeysockets/baileys';
+import { firestoreFetch, FIREBASE_PROJECT_ID, TENANT_ID } from './firebase-client.js';
+import { sessionDocumentId, sessionDocumentBelongsTo, safeSessionFileName } from './listener-scope.js';
 
 const FIRESTORE_BASE_URL = (projectId) =>
   `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/settings`;
 
-function toDocId(fileName) {
-  // Prefijo 'whatsapp_status_session_' compatible nativamente con las reglas de Firestore de Kindev Meta Ads
-  return 'whatsapp_status_session_' + fileName.replace(/[^a-zA-Z0-9_-]/g, '_');
+function toDocId(fileName) { return sessionDocumentId(fileName, TENANT_ID); }
+async function listSessionDocuments(projectId) {
+  const found = [];
+  let nextPageToken = '';
+  do {
+    const params = new URLSearchParams({pageSize:'300'});
+    if (nextPageToken) params.set('pageToken', nextPageToken);
+    const response = await firestoreFetch(FIRESTORE_BASE_URL(projectId) + '?' + params);
+    if (!response.ok) throw new Error('Session storage HTTP ' + response.status);
+    const data = await response.json();
+    found.push(...(data.documents || []).filter(doc => sessionDocumentBelongsTo(doc.name.split('/').pop(), TENANT_ID)));
+    nextPageToken = data.nextPageToken || '';
+  } while (nextPageToken);
+  return found;
 }
 
 /**
@@ -67,7 +80,7 @@ function getEncryptionKey(explicitKey) {
  */
 export async function restoreSessionFromFirestore(
   folder,
-  projectId = process.env.FIREBASE_PROJECT_ID,
+  projectId = FIREBASE_PROJECT_ID,
   encryptionKey = null
 ) {
   if (!projectId) {
@@ -88,17 +101,7 @@ export async function restoreSessionFromFirestore(
 
     const secret = getEncryptionKey(encryptionKey);
     console.log(`[Firestore Auth] 🔄 Buscando sesión previa en Firestore (proyecto: ${projectId})...`);
-    const res = await fetch(`${FIRESTORE_BASE_URL(projectId)}?pageSize=300`);
-    if (!res.ok) {
-      console.log(`[Firestore Auth] ⚠️ No se pudo consultar Firestore (HTTP ${res.status}).`);
-      return false;
-    }
-
-    const data = await res.json();
-    const docs = (data.documents || []).filter((d) => {
-      const docName = d.name.split('/').pop();
-      return docName.startsWith('whatsapp_status_session_') || docName.startsWith('whatsapp_session_');
-    });
+    const docs = await listSessionDocuments(projectId);
 
     if (docs.length === 0) {
       console.log('[Firestore Auth] ℹ️ No hay sesión previa guardada en Firestore. Se generará un nuevo QR.');
@@ -112,7 +115,9 @@ export async function restoreSessionFromFirestore(
       if (fileName && rawData) {
         const decryptedData = decryptPayload(rawData, secret);
         if (decryptedData) {
-          fs.writeFileSync(path.join(folder, fileName), decryptedData, 'utf8');
+          const safeFileName = safeSessionFileName(fileName);
+          if (!safeFileName) continue;
+          fs.writeFileSync(path.join(folder, safeFileName), decryptedData, 'utf8');
           restoredCount++;
         }
       }
@@ -132,7 +137,7 @@ export async function restoreSessionFromFirestore(
 export async function saveFileToFirestore(
   fileName,
   rawData,
-  projectId = process.env.FIREBASE_PROJECT_ID,
+  projectId = FIREBASE_PROJECT_ID,
   encryptionKey = null
 ) {
   if (!projectId) return;
@@ -143,7 +148,7 @@ export async function saveFileToFirestore(
     const secret = getEncryptionKey(encryptionKey);
     const encryptedData = encryptPayload(rawData, secret);
 
-    let response = await fetch(url, {
+    let response = await firestoreFetch(url, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -159,7 +164,7 @@ export async function saveFileToFirestore(
     if (!response.ok) {
       // Reintento único si el servidor o Firestore responde con error temporal
       await new Promise((r) => setTimeout(r, 500));
-      await fetch(url, {
+      await firestoreFetch(url, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -183,14 +188,14 @@ export async function saveFileToFirestore(
  */
 export async function removeFileFromFirestore(
   fileName,
-  projectId = process.env.FIREBASE_PROJECT_ID
+  projectId = FIREBASE_PROJECT_ID
 ) {
   if (!projectId) return;
 
   try {
     const docId = toDocId(fileName);
     const url = `${FIRESTORE_BASE_URL(projectId)}/${docId}`;
-    await fetch(url, { method: 'DELETE' });
+    await firestoreFetch(url, { method: 'DELETE' });
   } catch (err) {
     console.error(`[Firestore Auth] ❌ Error eliminando ${fileName} de Firestore:`, err.message);
   }
@@ -200,18 +205,12 @@ export async function removeFileFromFirestore(
  * Borra toda la sesión almacenada en Firestore.
  */
 export async function clearFirestoreSession(
-  projectId = process.env.FIREBASE_PROJECT_ID
+  projectId = FIREBASE_PROJECT_ID
 ) {
   if (!projectId) return;
 
   try {
-    const res = await fetch(`${FIRESTORE_BASE_URL(projectId)}?pageSize=300`);
-    if (!res.ok) return;
-    const data = await res.json();
-    const docs = (data.documents || []).filter((d) => {
-      const docName = d.name.split('/').pop();
-      return docName.startsWith('whatsapp_status_session_') || docName.startsWith('whatsapp_session_');
-    });
+    const docs = await listSessionDocuments(projectId);
     await Promise.all(
       docs.map((doc) => fetch(`https://firestore.googleapis.com/v1/${doc.name}`, { method: 'DELETE' }))
     );
@@ -252,7 +251,7 @@ async function runQueue() {
  */
 export async function useFirestoreAuthState(
   folder,
-  projectId = process.env.FIREBASE_PROJECT_ID,
+  projectId = FIREBASE_PROJECT_ID,
   encryptionKey = null
 ) {
   // 1. Restaurar y descifrar desde Firestore si está configurado y no hay archivos locales
