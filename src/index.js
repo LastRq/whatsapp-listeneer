@@ -342,7 +342,7 @@ async function connectToWhatsApp() {
 
     // Escuchar mensajes entrantes
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
-      if (type !== 'notify') return;
+      if (!Array.isArray(messages)) return;
 
       for (const msg of messages) {
         if (!msg.message || msg.key.remoteJid === 'status@broadcast') continue;
@@ -386,18 +386,18 @@ async function connectToWhatsApp() {
           text = '[Mensaje multimedia o sin texto directo]';
         }
 
-        // FILTRO 1: Descartar contactos de agenda personal
-        if (savedContacts.has(senderPhone)) {
-          console.log(`\n⛔ [FILTRO AGENDA] Contacto personal descartado (${maskPhone(senderPhone)} - "${pushName}").`);
-          continue;
-        }
-
         // Determinar si la sesión activa es de Miranda o Kindev
         const connectedId = connectedUser?.id || '';
         const cleanConnected = connectedId.split(':')[0].replace(/\D/g, '');
         const isKindevPhone = cleanConnected === '593991952889' || cleanConnected === '593991952888';
         const isMirandaActive = !isKindevPhone || TENANT_ID.includes('miranda') || TENANT_ID.includes('gabriel');
         const targetTenant = isMirandaActive ? 'gabriel_miranda_gi1yk' : TENANT_ID;
+
+        // Descartar únicamente números propios de la empresa o el propio celular conectado
+        if (senderPhone === cleanConnected || senderPhone === '593991952889' || senderPhone === '593991952888') {
+          console.log(`\n⛔ [PROPIO] Mensaje de número propio descartado (${senderPhone}).`);
+          continue;
+        }
 
         // FILTRO 2: Detectar metadatos nativos de anuncios de Meta (CTWA)
         const adInfo = extractMetaAdInfo(msg);
