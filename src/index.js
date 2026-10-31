@@ -392,16 +392,18 @@ async function connectToWhatsApp() {
           continue;
         }
 
+        // Determinar si la sesión activa es de Miranda o Kindev
+        const connectedId = connectedUser?.id || '';
+        const cleanConnected = connectedId.split(':')[0].replace(/\D/g, '');
+        const isKindevPhone = cleanConnected === '593991952889' || cleanConnected === '593991952888';
+        const isMirandaActive = !isKindevPhone || TENANT_ID.includes('miranda') || TENANT_ID.includes('gabriel');
+        const targetTenant = isMirandaActive ? 'gabriel_miranda_gi1yk' : TENANT_ID;
+
         // FILTRO 2: Detectar metadatos nativos de anuncios de Meta (CTWA)
         const adInfo = extractMetaAdInfo(msg);
 
-        if (ONLY_META_ADS && !adInfo) {
-          console.log(`\n⛔ [FILTRO NO-PUBLICIDAD] Mensaje de ${maskPhone(senderPhone)} ("${pushName}") no proviene de anuncio de Meta. Descartado.`);
-          continue;
-        }
-
-        console.log(`\n🎯 [LEAD META ADS CONFIRMADO]`);
-        console.log(`👤 Prospecto: ${pushName} (${maskPhone(senderPhone)})`);
+        console.log(`\n🎯 [PROSPECTO ENTRANTE CONFIRMADO]`);
+        console.log(`👤 Prospecto: ${pushName} (${maskPhone(senderPhone)}) -> Cuenta: ${targetTenant}`);
         if (adInfo) {
           console.log(`📢 Fuente: ${adInfo.source} | App: ${adInfo.app}`);
           if (adInfo.adTitle) console.log(`📌 Anuncio: "${adInfo.adTitle}"`);
@@ -410,7 +412,7 @@ async function connectToWhatsApp() {
         if (IS_DEBUG) {
           console.log(`💬 Mensaje (DEBUG): "${text}"`);
         } else {
-          console.log(`💬 Contenido: ${mediaType === 'audio' ? text : `[${text.length} caracteres - Protegido por privacidad]`}`);
+          console.log(`💬 Contenido: ${mediaType === 'audio' ? text : `[${text.length} caracteres]`}`);
         }
 
         const leadPayload = {
@@ -420,8 +422,13 @@ async function connectToWhatsApp() {
           event: 'whatsapp_lead_received',
           adInfo: adInfo || null,
           mediaType,
-          source: 'meta_ads_ctwa',
-          service: adInfo?.adTitle ? `Meta Ad: ${adInfo.adTitle}` : 'Meta Ads WhatsApp Lead',
+          tenantId: targetTenant,
+          source: adInfo ? 'meta_ads_ctwa' : 'whatsapp_auto',
+          service: adInfo?.adTitle
+            ? `Meta Ad: ${adInfo.adTitle}`
+            : isMirandaActive
+              ? 'Promoción Campaña ($50 USD)'
+              : 'Contacto WhatsApp Lead',
           sender: {
             phone: senderPhone,
             name: pushName,
