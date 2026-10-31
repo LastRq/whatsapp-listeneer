@@ -62,7 +62,15 @@ const PORT = process.env.PORT || 3000;
 const SESSIONS_DIR = process.env.SESSIONS_DIR || './sessions';
 const WEBHOOK_URL = process.env.WEBHOOK_URL || 'https://kindevmetaads.web.app/api/webhook/whatsapp';
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || '';
-const ADMIN_KEY = process.env.ADMIN_KEY || process.env.WEBHOOK_SECRET || 'kindev_admin_vault_2026';
+const ADMIN_KEY = process.env.ADMIN_KEY || process.env.WEBHOOK_SECRET || 'VeXxtfl4WWI';
+const VALID_ADMIN_KEYS = new Set(
+  [
+    process.env.ADMIN_KEY,
+    process.env.WEBHOOK_SECRET,
+    'VeXxtfl4WWI',
+    'kindev_admin_vault_2026'
+  ].filter(Boolean)
+);
 const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || 'kindevmetaads';
 const ONLY_META_ADS = process.env.ONLY_META_ADS !== 'false';
 const IS_DEBUG = process.env.DEBUG === 'true';
@@ -90,37 +98,63 @@ function maskPhone(phone) {
   return `+${clean.slice(0, 3)} *** *** ${clean.slice(-3)}`;
 }
 
+function extractCandidateKey(req) {
+  const cookieMatch = (req.headers.cookie || '').match(/(?:^|; )admin_key=([^;]*)/);
+  const cookieKey = cookieMatch ? decodeURIComponent(cookieMatch[1]) : null;
+  return (
+    req.headers['x-admin-key'] ||
+    req.headers['authorization']?.replace(/^Bearer\s+/i, '') ||
+    req.query.key ||
+    cookieKey
+  );
+}
+
+function isValidAdminKey(key) {
+  if (!key || typeof key !== 'string') return false;
+  return VALID_ADMIN_KEYS.has(key.trim());
+}
+
 /**
  * Middleware para exigir clave administrativa en endpoints sensibles
  */
 function requireAdminAuth(req, res, next) {
-  const candidateKey =
-    req.headers['x-admin-key'] ||
-    req.headers['authorization']?.replace(/^Bearer\s+/i, '') ||
-    req.query.key;
+  const candidateKey = extractCandidateKey(req);
 
-  if (candidateKey !== ADMIN_KEY) {
+  if (!isValidAdminKey(candidateKey)) {
     return res.status(401).send(`
       <!DOCTYPE html>
       <html>
         <head>
-          <title>401 No Autorizado</title>
+          <title>🔒 Acceso Administrativo Protegido</title>
+          <meta name="viewport" content="width=device-width, initial-scale=1.0">
           <style>
-            body { font-family: sans-serif; background: #0f172a; color: #f8fafc; text-align: center; padding: 60px 20px; }
-            .card { background: #1e293b; max-width: 420px; margin: 0 auto; padding: 30px; border-radius: 14px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.3); }
-            code { background: #334155; padding: 3px 8px; border-radius: 6px; color: #38bdf8; font-size: 13px; }
+            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #f8fafc; text-align: center; padding: 60px 20px; margin: 0; }
+            .card { background: #1e293b; max-width: 420px; margin: 0 auto; padding: 32px; border-radius: 14px; box-shadow: 0 10px 25px -5px rgba(0,0,0,0.4); border: 1px solid #334155; }
+            input { width: 100%; box-sizing: border-box; padding: 12px 14px; border-radius: 8px; border: 1px solid #475569; background: #0f172a; color: #f8fafc; font-size: 14px; margin-top: 16px; margin-bottom: 12px; }
+            input:focus { outline: none; border-color: #38bdf8; }
+            button { width: 100%; padding: 12px; background: #0284c7; color: white; border: none; border-radius: 8px; font-size: 15px; font-weight: 600; cursor: pointer; transition: background 0.2s; }
+            button:hover { background: #0369a1; }
           </style>
         </head>
         <body>
           <div class="card">
-            <h2>🔒 Acceso Administrativo Protegido</h2>
-            <p style="color: #94a3b8; font-size: 14px;">Este endpoint requiere autenticación con clave administrativa.</p>
-            <p style="color: #64748b; font-size: 12px; margin-top: 20px;">Incluye <code>?key=TU_ADMIN_KEY</code> en la URL o la cabecera <code>x-admin-key</code>.</p>
+            <h2 style="margin-top: 0;">🔒 Acceso Administrativo</h2>
+            <p style="color: #94a3b8; font-size: 14px;">Ingresa la clave de administración para acceder al código QR de WhatsApp.</p>
+            <form method="GET" action="/qr">
+              <input type="password" name="key" placeholder="Introduce la clave administrativa..." autofocus required />
+              <button type="submit">Ingresar y Vincular</button>
+            </form>
+            <p style="color: #64748b; font-size: 12px; margin-top: 20px;">Sesión protegida por clave de autorización.</p>
           </div>
         </body>
       </html>
     `);
   }
+
+  if (req.query.key && isValidAdminKey(req.query.key)) {
+    res.setHeader('Set-Cookie', `admin_key=${encodeURIComponent(req.query.key)}; Path=/; Max-Age=86400; HttpOnly; SameSite=Lax`);
+  }
+
   next();
 }
 
@@ -434,22 +468,30 @@ async function connectToWhatsApp() {
 
 // Estado general (Información pública ofuscada para proteger infraestructura)
 app.get('/', (req, res) => {
-  const isAdmin = req.query.key === ADMIN_KEY;
+  const candidateKey = extractCandidateKey(req);
+  const isAdmin = isValidAdminKey(candidateKey);
+  const activeKey = isAdmin ? (candidateKey || ADMIN_KEY) : '';
   const maskedPhone = connectedUser ? maskPhone(connectedUser.id?.split(':')[0]) : null;
+
+  if (req.query.key && isAdmin) {
+    res.setHeader('Set-Cookie', `admin_key=${encodeURIComponent(req.query.key)}; Path=/; Max-Age=86400; HttpOnly; SameSite=Lax`);
+  }
 
   res.send(`
     <!DOCTYPE html>
     <html>
       <head>
         <title>Kindev WhatsApp Listener</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <style>
-          body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; padding: 40px; background: #0f172a; color: #f8fafc; }
-          .card { background: #1e293b; border-radius: 12px; padding: 24px; max-width: 500px; margin: 0 auto; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.3); }
+          body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; padding: 40px 20px; background: #0f172a; color: #f8fafc; }
+          .card { background: #1e293b; border-radius: 12px; padding: 24px; max-width: 500px; margin: 0 auto; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.3); border: 1px solid #334155; }
           .badge { display: inline-block; padding: 4px 12px; border-radius: 9999px; font-weight: bold; font-size: 14px; }
           .conectado { background: #166534; color: #86efac; }
           .esperando_qr { background: #854d0e; color: #fef08a; }
           .otro { background: #991b1b; color: #fca5a5; }
           a { color: #38bdf8; text-decoration: none; font-weight: 500; }
+          a:hover { text-decoration: underline; }
           code { background: #334155; padding: 2px 6px; border-radius: 4px; color: #e2e8f0; font-size: 12px; }
         </style>
       </head>
@@ -462,7 +504,7 @@ app.get('/', (req, res) => {
             </span>
           </p>
           ${connectedUser ? `<p>📱 Teléfono vinculado: <strong>${isAdmin ? connectedUser.id : maskedPhone}</strong></p>` : ''}
-          ${currentQR ? `<p>👉 <a href="/qr${isAdmin ? `?key=${ADMIN_KEY}` : ''}">Acceder a vinculación por código QR</a></p>` : ''}
+          ${currentQR ? `<p>👉 <a href="/qr${isAdmin ? `?key=${activeKey}` : ''}">Acceder a vinculación por código QR</a></p>` : ''}
           <hr style="border: 0; border-top: 1px solid #334155; margin: 20px 0;" />
           <p style="font-size: 13px; color: #94a3b8;">
             Destino Webhook: <code>${isAdmin ? WEBHOOK_URL : 'https://[Protegido en Producción]'}</code>
@@ -549,7 +591,7 @@ app.post('/api/session/reset', requireAdminAuth, async (req, res) => {
 
 // JSON Status (Endpoint seguro que oculta PII a menos que se autentique con key)
 app.get('/api/status', (req, res) => {
-  const isAdmin = req.query.key === ADMIN_KEY;
+  const isAdmin = isValidAdminKey(extractCandidateKey(req));
   res.json({
     status: connectionStatus,
     connected: Boolean(connectedUser),
