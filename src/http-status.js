@@ -11,7 +11,7 @@ export function statusCors(req, res, next) {
   }
   next();
 }
-export function publicListenerStatus({ status, phone, tenantId, projectId, hasQR, filterActive, now = Date.now() }) {
+export function publicListenerStatus({ status, phone, tenantId, instanceId, projectId, hasQR, filterActive, now = Date.now() }) {
   const connected = status === 'conectado' && Boolean(phone);
-  return { status, connected, isListening: connected, tenantId, projectId, hasQR: Boolean(hasQR), phone: connected ? phone : null, filterActive, updatedAt: new Date(now).toISOString(), version: 'kindevads-tenants-1' };
+  return { status, connected, isListening: connected, tenantId, instanceId, projectId, hasQR: Boolean(hasQR), phone: connected ? phone : null, filterActive, updatedAt: new Date(now).toISOString(), version: 'kindevads-tenants-1' };
 }

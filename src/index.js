@@ -260,13 +260,19 @@ async function saveLeadDirectToFirestore(projectId, payload) {
  * Reporta el estado de conexión y heartbeat a Cloud Firestore para Kindev Meta Ads
  */
 const FIRESTORE_STATUS_URL = (projectId) =>
-  `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/settings/whatsapp_status_${TENANT_ID}`;
+  `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/settings/whatsapp_status_cloud_${TENANT_ID}`;
 
 const HEARTBEAT_INTERVAL_MS = 4 * 60 * 1000;
 let lastStatusWritten = '';
 let lastStatusWriteTime = 0;
+let statusQueue = Promise.resolve();
+const INSTANCE_ID = crypto.randomUUID();
+function updateFirestoreStatus(...args) {
+  statusQueue = statusQueue.then(() => writeFirestoreStatus(...args)).catch(error => console.error('[Status]', error.message));
+  return statusQueue;
+}
 
-async function updateFirestoreStatus(status, user = '', note = '', force = false) {
+async function writeFirestoreStatus(status, user = '', note = '', force = false) {
   if (!FIREBASE_PROJECT_ID) return;
   const now = Date.now();
   const statusKey = `${status}|${user}|${note}`;
@@ -280,7 +286,7 @@ async function updateFirestoreStatus(status, user = '', note = '', force = false
       fields: {
         tenantId: { stringValue: TENANT_ID },
         projectId: { stringValue: FIREBASE_PROJECT_ID },
-        instanceId: { stringValue: process.env.RENDER_SERVICE_ID || TENANT_ID },
+        instanceId: { stringValue: INSTANCE_ID },
         status: { stringValue: status },
         user: { stringValue: user || '' },
         note: { stringValue: note || '' },
@@ -676,6 +682,7 @@ app.get('/api/status', (req, res) => {
     status: connectionStatus,
     phone: isAdmin ? connectedUser?.id : (connectedUser ? maskPhone(connectedUser.id?.split(':')[0]) : null),
     tenantId: TENANT_ID,
+    instanceId: INSTANCE_ID,
     projectId: FIREBASE_PROJECT_ID,
     hasQR: Boolean(currentQR),
     filterActive: ONLY_META_ADS

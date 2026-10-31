@@ -19,7 +19,7 @@ El proceso obtiene una sesión autenticada de Firebase y renueva su token en mem
 ## Separación
 
 Cada instancia:
-- Publica su estado en `settings/whatsapp_status_TENANT_ID`.
+- Publica su estado en `settings/whatsapp_status_cloud_TENANT_ID`.
 - Guarda contactos con su propio `tenantId`.
 - Restaura y elimina únicamente los archivos de sesión de su cuenta.
 - Conserva las credenciales de WhatsApp cifradas en Firestore y utiliza una caché efímera propia.
