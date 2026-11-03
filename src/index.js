@@ -2005,7 +2005,7 @@ app.get('/api/system/apis-status', async (req, res) => {
 
 // Servir frontend SPA para cualquier otra ruta
 app.get('*', (req, res) => {
-  res.sendFile(path.join(__dirname, 'dist', 'index.html'));
+  const f = path.join(__dirname, 'dist', 'index.html'); if (fs.existsSync(f)) { return res.sendFile(f); } res.send('<h3>WhatsApp Listener Bot Activo</h3><p><a href="/qr">Escanear QR</a></p>');
 });
 
 app.listen(PORT, () => {
