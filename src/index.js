@@ -11,6 +11,23 @@ import pino from 'pino';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// Interceptor silencioso para ruidos criptográficos transitorios de Baileys / libsignal (Bad MAC)
+const originalConsoleError = console.error;
+console.error = function (...args) {
+  const fullMsg = args.map(a => (typeof a === 'object' && a?.stack ? a.stack : String(a))).join(' ');
+  if (
+    fullMsg.includes('Failed to decrypt message with any known session') ||
+    fullMsg.includes('Bad MAC') ||
+    fullMsg.includes('verifyMAC') ||
+    fullMsg.includes('doDecryptWhisperMessage')
+  ) {
+    // Ignorar ruidos transitorios de desincronización de llaves antiguas de WhatsApp
+    return;
+  }
+  originalConsoleError.apply(console, args);
+};
+
+
 try {
   if (typeof process.loadEnvFile === 'function') {
     process.loadEnvFile();
