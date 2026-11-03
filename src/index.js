@@ -438,29 +438,67 @@ const EXCLUDED_PHONES = ['593991952889', '593991952888'];
 // Mapeo en memoria de clientes existentes en Firestore para PREVENIR DUPLICADOS
 const existingFirestoreLeadsByPhone = new Map(); // phone -> { id, name, status, amount, notes }
 
-async function syncFirestoreExistingLeadsCache() {
+const LEADS_DISK_CACHE_FILE = path.join(AUTH_DIR, 'firestore_leads_cache.json');
+
+async function syncFirestoreExistingLeadsCache(force = false) {
+  // 1. Intentar cargar desde el Persistent Disk (0 cuotas de Firestore)
+  if (!force && fs.existsSync(LEADS_DISK_CACHE_FILE)) {
+    try {
+      const stat = fs.statSync(LEADS_DISK_CACHE_FILE);
+      const ageHours = (Date.now() - stat.mtimeMs) / (1000 * 60 * 60);
+      if (ageHours < 24) { // Válido por 24 horas en disco
+        const cachedRaw = JSON.parse(fs.readFileSync(LEADS_DISK_CACHE_FILE, 'utf8'));
+        if (Array.isArray(cachedRaw) && cachedRaw.length > 0) {
+          existingFirestoreLeadsByPhone.clear();
+          for (const item of cachedRaw) {
+            existingFirestoreLeadsByPhone.set(item.phone, item.data);
+          }
+          console.log(`⚡ [Anti-Duplicados Disco] Cargados ${existingFirestoreLeadsByPhone.size} clientes desde caché persistente en disco (0 lecturas a Firestore).`);
+          return;
+        }
+      }
+    } catch (e) {
+      // Ignorar y leer de red
+    }
+  }
+
+  // 2. Si no hay disco o expiró, consultar Firestore con límite acotado (50 más recientes)
   try {
-    const res = await fetch(`${FIRESTORE_REST_URL}?pageSize=300`);
-    if (!res.ok) return;
+    const res = await fetch(`${FIRESTORE_REST_URL}?pageSize=50`);
+    if (!res.ok) {
+      if (res.status === 429) {
+        console.warn('⚠️ [Firestore Cuota Excedida] Usando registros en memoria/disco.');
+      }
+      return;
+    }
     const data = await res.json();
     const docs = data.documents || [];
     existingFirestoreLeadsByPhone.clear();
+    const toDisk = [];
     for (const d of docs) {
       const id = d.name.split('/').pop();
       const f = d.fields || {};
       const ph = cleanPhone(f.phone?.stringValue || '');
       if (ph) {
-        existingFirestoreLeadsByPhone.set(ph, {
+        const itemData = {
           id,
           name: f.name?.stringValue || '',
           status: f.status?.stringValue || 'prospecto',
           amount: f.amount?.doubleValue || f.amount?.integerValue || 0,
           notes: f.notes?.stringValue || '',
           service: f.service?.stringValue || ''
-        });
+        };
+        existingFirestoreLeadsByPhone.set(ph, itemData);
+        toDisk.push({ phone: ph, data: itemData });
       }
     }
     console.log(`🛡️ [Anti-Duplicados] Sincronizados ${existingFirestoreLeadsByPhone.size} clientes existentes de Firestore.`);
+    // Guardar en disco persistente para futuros reinicios
+    try {
+      const dir = path.dirname(LEADS_DISK_CACHE_FILE);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(LEADS_DISK_CACHE_FILE, JSON.stringify(toDisk), 'utf8');
+    } catch (e) {}
   } catch (err) {
     console.warn('⚠️ Error sincronizando caché de Firestore:', err.message);
   }
