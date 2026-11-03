@@ -961,7 +961,8 @@ async function startTenantWhatsAppBot(rawTenantId = 'kindev') {
       auth: state,
       logger,
       printQRInTerminal: false,
-      browser: [`Kindev Ads (${tenantId})`, 'Chrome', '1.0.0']
+      browser: [`Kindev Ads (${tenantId})`, 'Chrome', '1.0.0'],
+      getMessage: async (key) => undefined
     });
 
     session.sock = sock;
@@ -2009,8 +2010,9 @@ app.get('*', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 [Kindev CAPI & WhatsApp Server] Activo en puerto ${PORT}`);
-  console.log(`👉 Abre en tu navegador para escanear el QR: http://localhost:${PORT}/qr`);
+  const publicUrl = process.env.RENDER_EXTERNAL_URL || 'https://whatsapp-listeneer.onrender.com';
+  console.log(`🚀 [Kindev CAPI & WhatsApp Server] Activo en puerto ${PORT} (Render Nube)`);
+  console.log(`👉 Enlace Seguro del QR: ${publicUrl}/qr`);
 });
 
 // Protección contra caídas accidentales del proceso Node.js (EPIPE en pipes rotos de Windows)
@@ -2018,8 +2020,12 @@ process.stdout?.on('error', (err) => { if (err?.code === 'EPIPE') return; });
 process.stderr?.on('error', (err) => { if (err?.code === 'EPIPE') return; });
 process.on('uncaughtException', (err) => {
   if (err?.code === 'EPIPE') return;
+  const msg = String(err?.message || err || '');
+  if (msg.includes('Bad MAC') || msg.includes('Session error') || msg.includes('Failed to decrypt')) return;
   console.error('⚠️ [Kindev Daemon - Excepción no capturada]:', err?.message || err);
 });
 process.on('unhandledRejection', (reason) => {
+  const msg = String(reason?.message || reason || '');
+  if (msg.includes('Bad MAC') || msg.includes('Session error') || msg.includes('Failed to decrypt')) return;
   console.error('⚠️ [Kindev Daemon - Promesa rechazada]:', reason);
 });
