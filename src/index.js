@@ -595,6 +595,59 @@ function addToRecentMessagesBuffer(msg) {
 const inFlightPhones = new Set();
 
 // Función maestra de procesamiento con Bloque de Decisión Bimodal
+
+function extractMetaAdInfo(msg) {
+  const m = msg.message;
+  if (!m) return null;
+
+  let context = m.contextInfo;
+  if (!context) {
+    for (const key of Object.keys(m)) {
+      if (m[key] && typeof m[key] === 'object' && m[key].contextInfo) {
+        context = m[key].contextInfo;
+        break;
+      }
+    }
+  }
+
+  if (!context) return null;
+
+  const source = String(context.entryPointConversionSource || '').toLowerCase();
+  const app = String(context.entryPointConversionApp || '').toLowerCase();
+  const extSource = String(context.entryPointConversionExternalSource || '').toLowerCase();
+  const conversionSource = String(context.conversionSource || '').toLowerCase();
+
+  const isMetaSource =
+    source.includes('ad') ||
+    source.includes('ctwa') ||
+    source.includes('fb') ||
+    source.includes('ig') ||
+    source.includes('meta') ||
+    app.includes('facebook') ||
+    app.includes('instagram') ||
+    extSource.includes('ad') ||
+    conversionSource.includes('ad');
+
+  const hasCtwa = Boolean(context.ctwaPayload || context.ctwaSignals);
+  const hasAdReply = Boolean(context.externalAdReply || context.quotedAd);
+  const hasCampaign = Boolean(context.smbServerCampaignId || context.smbClientCampaignId);
+
+  if (isMetaSource || hasCtwa || hasAdReply || hasCampaign) {
+    return {
+      isAd: true,
+      source: context.entryPointConversionSource || context.entryPointConversionApp || 'meta_ad',
+      app: context.entryPointConversionApp || 'facebook/instagram',
+      adTitle: context.externalAdReply?.title || '',
+      adBody: context.externalAdReply?.body || '',
+      campaignId: context.smbServerCampaignId || context.smbClientCampaignId || '',
+      hasCtwaPayload: hasCtwa,
+      ctwaClid: context.externalAdReply?.ctwaClid || context.ctwaClid || ''
+    };
+  }
+
+  return null;
+}
+
 async function processIncomingMessage(sock, msg, contextSource = 'live', sessionTenantId = 'kindev') {
   if (!msg) return { saved: false, reason: 'no_msg' };
   addToRecentMessagesBuffer(msg);
@@ -724,14 +777,24 @@ async function processIncomingMessage(sock, msg, contextSource = 'live', session
       else if (isMedia) text = '[Archivo multimedia / Documento recibido]';
     }
 
-    // 9. Detección real de Anuncio Meta Ads (CTWA)
-    const hasMetaAdReferral = !!(
+    // 9. Detección exhaustiva de metadatos de Anuncio Meta Ads (CTWA)
+    const metaAdData = extractMetaAdInfo(msg);
+    const hasMetaAdReferral = Boolean(
+      metaAdData ||
       innerMessage?.extendedTextMessage?.contextInfo?.externalAdReply ||
       innerMessage?.extendedTextMessage?.contextInfo?.advertisementDetails ||
       innerMessage?.extendedTextMessage?.contextInfo?.referral ||
       innerMessage?.templateButtonReplyMessage ||
       innerMessage?.buttonsResponseMessage
     );
+
+    // FILTRO ESTRICTO: Solo aceptar mensajes originados en anuncios de Meta Ads
+    const ONLY_META_ADS = process.env.ONLY_META_ADS !== 'false';
+    if (ONLY_META_ADS && !hasMetaAdReferral) {
+      console.log(`🛡️ [Filtro Publicitario] Mensaje de ${pushName} (${displayPhone}) descartado: NO proviene de anuncio de Meta Ads.`);
+      if (msgId) markMessageIdProcessed(msgId);
+      return { saved: false, reason: 'not_meta_ad_referral' };
+    }
 
     // 10. Descarte de paquetes vacíos (sin texto, sin audio, sin medios y sin referencia publicitaria)
     if (!text.trim() && !isAudio && !isMedia && !hasMetaAdReferral) {
