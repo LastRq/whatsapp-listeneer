@@ -461,6 +461,98 @@ const BUSINESS_AUTOREPLY_PATTERNS = [
 // Lista de teléfonos propios o internos a excluir de auto-captura
 const EXCLUDED_PHONES = ['593991952889', '593991952888'];
 
+// === MÓDULO BLACKLIST (NÚMEROS FILTRADOS - NO ES UN CLIENTE) ===
+const BLACKLIST_FILE = path.join(AUTH_DIR, 'blacklist.json');
+let blacklistData = [];
+
+function loadBlacklist() {
+  try {
+    if (fs.existsSync(BLACKLIST_FILE)) {
+      blacklistData = JSON.parse(fs.readFileSync(BLACKLIST_FILE, 'utf8'));
+      if (!Array.isArray(blacklistData)) blacklistData = [];
+    }
+  } catch (e) {
+    blacklistData = [];
+  }
+}
+
+function saveBlacklist() {
+  try {
+    const dir = path.dirname(BLACKLIST_FILE);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(BLACKLIST_FILE, JSON.stringify(blacklistData, null, 2), 'utf8');
+  } catch {}
+}
+
+loadBlacklist();
+
+function isPhoneBlacklisted(phone, tenantId) {
+  if (!phone) return false;
+  const clean = cleanPhone(phone);
+  const safeTenant = sanitizeTenantId(tenantId || 'kindev');
+  return blacklistData.some(b => {
+    const bClean = cleanPhone(b.cleanPhone || b.phone || '');
+    const matchPhone = bClean === clean || (clean && bClean && (clean.endsWith(bClean) || bClean.endsWith(clean)));
+    const matchTenant = !b.tenantId || b.tenantId === safeTenant || safeTenant === 'kindev';
+    return matchPhone && matchTenant;
+  });
+}
+
+function addToBlacklist({ phone, name, tenantId, reason }) {
+  const clean = cleanPhone(phone);
+  if (!clean) return false;
+  const safeTenant = sanitizeTenantId(tenantId || 'kindev');
+  loadBlacklist();
+  const existingIdx = blacklistData.findIndex(b => cleanPhone(b.cleanPhone || b.phone) === clean && b.tenantId === safeTenant);
+  const entry = {
+    id: `blk_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+    phone: String(phone),
+    cleanPhone: clean,
+    name: name || 'No es un cliente',
+    tenantId: safeTenant,
+    reason: reason || 'No es un cliente',
+    createdAt: new Date().toISOString()
+  };
+  if (existingIdx >= 0) {
+    blacklistData[existingIdx] = entry;
+  } else {
+    blacklistData.unshift(entry);
+  }
+  saveBlacklist();
+
+  // Guardar en Supabase si existe la tabla
+  fetch(`${SUPABASE_URL}/rest/v1/blacklist`, {
+    method: 'POST',
+    headers: {
+      'apikey': SUPABASE_KEY,
+      'Authorization': `Bearer ${SUPABASE_KEY}`,
+      'Content-Type': 'application/json',
+      'Prefer': 'resolution=merge-duplicates'
+    },
+    body: JSON.stringify(entry)
+  }).catch(() => {});
+
+  return entry;
+}
+
+function removeFromBlacklist(phone, tenantId) {
+  const clean = cleanPhone(phone);
+  const safeTenant = sanitizeTenantId(tenantId || 'kindev');
+  loadBlacklist();
+  blacklistData = blacklistData.filter(b => !(cleanPhone(b.cleanPhone || b.phone) === clean && (!b.tenantId || b.tenantId === safeTenant)));
+  saveBlacklist();
+
+  fetch(`${SUPABASE_URL}/rest/v1/blacklist?clean_phone=eq.${encodeURIComponent(clean)}&tenant_id=eq.${encodeURIComponent(safeTenant)}`, {
+    method: 'DELETE',
+    headers: {
+      'apikey': SUPABASE_KEY,
+      'Authorization': `Bearer ${SUPABASE_KEY}`
+    }
+  }).catch(() => {});
+
+  return true;
+}
+
 // Mapeo en memoria de clientes existentes en Firestore para PREVENIR DUPLICADOS
 const existingFirestoreLeadsByPhone = new Map(); // phone -> { id, name, status, amount, notes }
 
@@ -877,10 +969,12 @@ async function processIncomingMessage(sock, msg, contextSource = 'live', session
   const cleanPh = cleanPhone(phone);
   if (!cleanPh) return { saved: false, reason: 'invalid_phone' };
 
-  // 6. Lista de exclusión de números propios / administradores
-  if (EXCLUDED_PHONES.includes(cleanPh)) {
+  // 6. Lista de exclusión de números propios / administradores Y BLACKLIST (No es un cliente)
+  const targetTenantId = sessionTenantId || 'kindev';
+  if (EXCLUDED_PHONES.includes(cleanPh) || isPhoneBlacklisted(cleanPh, targetTenantId) || isPhoneBlacklisted(phone, targetTenantId)) {
+    console.log(`🚫 [Blacklist / Excluido] Mensaje de ${msg.pushName || 'Contacto'} (+${cleanPh}) descartado: pertenece a la lista negra (No es un cliente).`);
     if (msgId) markMessageIdProcessed(msgId);
-    return { saved: false, reason: 'excluded_phone' };
+    return { saved: false, reason: 'blacklisted_phone' };
   }
 
   // 7. Mutex concurrente: si hay un procesamiento activo para este teléfono, esperar
@@ -1639,6 +1733,28 @@ app.get('/api/whatsapp/outbound-tracker-full', (req, res) => {
     dead7d,
     entries
   });
+});
+
+// Endpoints oficiales de Blacklist (Números Filtrados - "No es un cliente")
+app.get('/api/blacklist', (req, res) => {
+  loadBlacklist();
+  const tenantId = sanitizeTenantId(req.query.tenant || req.query.tenantId || 'kindev');
+  const filtered = blacklistData.filter(b => !b.tenantId || b.tenantId === tenantId || tenantId === 'kindev');
+  res.json({ success: true, count: filtered.length, blacklist: filtered });
+});
+
+app.post('/api/blacklist/add', express.json(), (req, res) => {
+  const { phone, name, tenantId, reason } = req.body || {};
+  if (!phone) return res.status(400).json({ success: false, error: 'Falta teléfono' });
+  const entry = addToBlacklist({ phone, name, tenantId, reason });
+  res.json({ success: true, entry });
+});
+
+app.post('/api/blacklist/remove', express.json(), (req, res) => {
+  const { phone, tenantId } = req.body || {};
+  if (!phone) return res.status(400).json({ success: false, error: 'Falta teléfono' });
+  removeFromBlacklist(phone, tenantId);
+  res.json({ success: true });
 });
 
 function getExpectedVinculationPin(tenantId) {
