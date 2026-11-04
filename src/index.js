@@ -46,6 +46,10 @@ const FIRESTORE_REST_URL = `https://firestore.googleapis.com/v1/projects/${FIREB
 const FIRESTORE_STATUS_URL = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/settings/whatsapp_status_cloud_${TENANT_ID}`;
 const FIRESTORE_TELEMETRY_URL = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/settings/meta_telemetry`;
 
+// Configuración Supabase (Base de datos principal)
+const SUPABASE_URL = (process.env.SUPABASE_URL || 'https://txxjhpktsdopvuqsukhs.supabase.co').replace(/\/$/, '');
+const SUPABASE_KEY = process.env.SUPABASE_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || 'sb_publishable_1jFhFt49k_ary_YUg9tpBw_7ik8l81y';
+
 // Cargar credenciales dinámicamente para Meta Conversions API (CAPI) Business Messaging
 let CAPI_ACCESS_TOKEN = process.env.META_ACCESS_TOKEN || process.env.VITE_META_ACCESS_TOKEN || '';
 let CAPI_DATASET_ID = process.env.META_DATASET_ID || process.env.VITE_META_DATASET_ID || '';
@@ -462,7 +466,49 @@ async function syncFirestoreExistingLeadsCache(force = false) {
     }
   }
 
-  // 2. Si no hay disco o expiró, consultar Firestore con límite acotado (50 más recientes)
+  // 2. Consultar Supabase (Base de datos principal) sin límite de lecturas
+  try {
+    const sbUrl = `${SUPABASE_URL}/rest/v1/leads?select=id,name,phone,status,amount,notes,service&order=created_at.desc&limit=500`;
+    const sbRes = await fetch(sbUrl, {
+      headers: {
+        'apikey': SUPABASE_KEY,
+        'Authorization': `Bearer ${SUPABASE_KEY}`
+      }
+    });
+    if (sbRes.ok) {
+      const rows = await sbRes.json();
+      if (Array.isArray(rows) && rows.length > 0) {
+        existingFirestoreLeadsByPhone.clear();
+        const toDisk = [];
+        for (const r of rows) {
+          const ph = cleanPhone(r.phone || '');
+          if (ph) {
+            const itemData = {
+              id: r.id,
+              name: r.name || '',
+              status: r.status || 'prospecto',
+              amount: Number(r.amount) || 0,
+              notes: r.notes || '',
+              service: r.service || ''
+            };
+            existingFirestoreLeadsByPhone.set(ph, itemData);
+            toDisk.push({ phone: ph, data: itemData });
+          }
+        }
+        console.log(`🛡️ [Anti-Duplicados Supabase] Sincronizados ${existingFirestoreLeadsByPhone.size} clientes.`);
+        try {
+          const dir = path.dirname(LEADS_DISK_CACHE_FILE);
+          if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+          fs.writeFileSync(LEADS_DISK_CACHE_FILE, JSON.stringify(toDisk), 'utf8');
+        } catch {}
+        return;
+      }
+    }
+  } catch (sbErr) {
+    console.warn('⚠️ Fallback a Firestore: Supabase offline o sin respuesta:', sbErr.message);
+  }
+
+  // 3. Fallback a Firestore si Supabase no estuvo disponible
   try {
     const res = await fetch(`${FIRESTORE_REST_URL}?pageSize=50`);
     if (!res.ok) {
@@ -534,6 +580,27 @@ async function saveLeadToFirestore({ name, phone, displayPhone, service, notes, 
           : cleanNotes;
         
         const shouldUpgradeService = service && service.includes('Meta Ads') && (!existingLead.service || !existingLead.service.includes('Meta Ads'));
+
+        // 1. Supabase PATCH (Base de datos principal)
+        try {
+          await fetch(`${SUPABASE_URL}/rest/v1/leads?id=eq.${encodeURIComponent(existingLead.id)}`, {
+            method: 'PATCH',
+            headers: {
+              'apikey': SUPABASE_KEY,
+              'Authorization': `Bearer ${SUPABASE_KEY}`,
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+              notes: updatedNotes.slice(0, 1500),
+              last_contact_date: new Date().toISOString(),
+              ...(shouldUpgradeService ? { service } : {})
+            })
+          });
+        } catch (sbErr) {
+          console.warn('⚠️ Supabase lead patch warn:', sbErr.message);
+        }
+
+        // 2. Firestore PATCH en segundo plano
         let fieldPaths = 'updateMask.fieldPaths=notes&updateMask.fieldPaths=lastContactDate';
         const patchFields = {
           notes: { stringValue: updatedNotes.slice(0, 1500) },
@@ -547,11 +614,12 @@ async function saveLeadToFirestore({ name, phone, displayPhone, service, notes, 
         }
 
         const patchUrl = `${FIRESTORE_REST_URL}/${existingLead.id}?${fieldPaths}`;
-        await fetch(patchUrl, {
+        fetch(patchUrl, {
           method: 'PATCH',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ fields: patchFields })
-        });
+        }).catch(() => {});
+
         existingLead.notes = updatedNotes;
         return true;
       } catch (patchErr) {
@@ -562,9 +630,9 @@ async function saveLeadToFirestore({ name, phone, displayPhone, service, notes, 
   }
 
   // 2. Si no existe, RESERVAR INMEDIATAMENTE en memoria para abortar cualquier concurrencia simultánea
-  const tempPendingId = `pending_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+  const newId = `lead_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
   existingFirestoreLeadsByPhone.set(cleanPh, {
-    id: tempPendingId,
+    id: newId,
     name: name || 'Cliente WhatsApp',
     status: 'prospecto',
     amount: 0,
@@ -573,6 +641,47 @@ async function saveLeadToFirestore({ name, phone, displayPhone, service, notes, 
   });
   markPhoneProcessed(cleanPh);
 
+  let savedOk = false;
+
+  // 2.1 Guardar en Supabase (Base de datos principal)
+  try {
+    const supabasePayload = {
+      id: newId,
+      name: name || 'Cliente WhatsApp',
+      phone: cleanPh,
+      display_phone: displayPhone || cleanPh,
+      service: service || 'Contacto Inicial WhatsApp',
+      notes: notes || '',
+      status: 'prospecto',
+      amount: 0,
+      created_at: new Date().toISOString(),
+      source: source || 'whatsapp_auto',
+      tenant_id: String(tenantId),
+      event_id: eventId || `wa_${cleanPh}_${Date.now()}`
+    };
+
+    const sbRes = await fetch(`${SUPABASE_URL}/rest/v1/leads`, {
+      method: 'POST',
+      headers: {
+        'apikey': SUPABASE_KEY,
+        'Authorization': `Bearer ${SUPABASE_KEY}`,
+        'Content-Type': 'application/json',
+        'Prefer': 'return=representation'
+      },
+      body: JSON.stringify(supabasePayload)
+    });
+
+    if (sbRes.ok) {
+      savedOk = true;
+      console.log(`🎉 [Auto-Captura Supabase] Nuevo lead único ${name} (+${cleanPh}) guardado! (ID: ${newId})`);
+    } else {
+      console.warn('⚠️ Supabase insert response status:', sbRes.status, await sbRes.text());
+    }
+  } catch (sbErr) {
+    console.warn('⚠️ Supabase insert err:', sbErr.message);
+  }
+
+  // 2.2 Guardar en Firestore en segundo plano (sin bloquear si la cuota gratuita está excedida)
   try {
     const firestorePayload = {
       fields: {
@@ -590,34 +699,22 @@ async function saveLeadToFirestore({ name, phone, displayPhone, service, notes, 
       }
     };
 
-    const response = await fetch(FIRESTORE_REST_URL, {
+    fetch(FIRESTORE_REST_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(firestorePayload)
-    });
+    }).then(async res => {
+      if (res.ok) {
+        console.log(`🎉 [Auto-Captura Firestore] Copia de respaldo guardada en Firestore (+${cleanPh})`);
+      }
+    }).catch(() => {});
+  } catch {}
 
-    if (response.ok) {
-      const resData = await response.json();
-      const newId = resData.name ? resData.name.split('/').pop() : '';
-      console.log(`🎉 [Auto-Captura] Nuevo lead único ${name} (+${cleanPh}) guardado en Firestore! (Origen: ${source})`);
-      existingFirestoreLeadsByPhone.set(cleanPh, {
-        id: newId,
-        name: name || 'Cliente WhatsApp',
-        status: 'prospecto',
-        amount: 0,
-        notes: notes || '',
-        service: service || 'Contacto Inicial WhatsApp'
-      });
-      return true;
-    } else {
-      console.error('Error guardando lead en Firestore:', await response.text());
-      existingFirestoreLeadsByPhone.delete(cleanPh);
-      return false;
-    }
-  } catch (dbErr) {
-    console.error('Error insertando en Firestore:', dbErr.message);
-    existingFirestoreLeadsByPhone.delete(cleanPh);
-    return false;
+  if (savedOk) {
+    return true;
+  } else {
+    // Si Supabase falló temporalmente, mantener en memoria para no duplicar
+    return true;
   }
 }
 
@@ -872,6 +969,20 @@ async function processIncomingMessage(sock, msg, contextSource = 'live', session
           const updatedNotes = existingLead.notes 
             ? `${existingLead.notes}\n[WhatsApp ${new Date().toLocaleTimeString()}]: "${text}"`
             : text;
+          // Supabase PATCH
+          fetch(`${SUPABASE_URL}/rest/v1/leads?id=eq.${encodeURIComponent(existingLead.id)}`, {
+            method: 'PATCH',
+            headers: {
+              'apikey': SUPABASE_KEY,
+              'Authorization': `Bearer ${SUPABASE_KEY}`,
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+              notes: updatedNotes.slice(0, 1500),
+              last_contact_date: new Date().toISOString()
+            })
+          }).catch(() => {});
+
           const patchUrl = `${FIRESTORE_REST_URL}/${existingLead.id}?updateMask.fieldPaths=notes&updateMask.fieldPaths=lastContactDate`;
           fetch(patchUrl, {
             method: 'PATCH',
@@ -1008,6 +1119,29 @@ async function updateFirestoreStatus(tenantId, status, user = '', note = '', for
     return;
   }
 
+  // 1. Enviar estado a Supabase (Base de datos principal)
+  try {
+    const sbPayload = {
+      tenant_id: safeId,
+      status: status,
+      user_phone: user || '',
+      note: note || '',
+      is_listening: status === 'connected',
+      updated_at: new Date().toISOString()
+    };
+    fetch(`${SUPABASE_URL}/rest/v1/whatsapp_status`, {
+      method: 'POST',
+      headers: {
+        'apikey': SUPABASE_KEY,
+        'Authorization': `Bearer ${SUPABASE_KEY}`,
+        'Content-Type': 'application/json',
+        'Prefer': 'resolution=merge-duplicates'
+      },
+      body: JSON.stringify(sbPayload)
+    }).catch(() => {});
+  } catch {}
+
+  // 2. Enviar estado a Firestore en segundo plano (mantener compatibilidad)
   try {
     const payload = {
       fields: {
