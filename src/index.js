@@ -27,6 +27,27 @@ console.error = function (...args) {
   originalConsoleError.apply(console, args);
 };
 
+// Silenciar volcados internos de SessionEntry de libsignal en consola
+const originalConsoleLog = console.log;
+console.log = function (...args) {
+  const fullMsg = args.map(a => (typeof a === 'object' ? (a?.message || String(a)) : String(a))).join(' ');
+  if (fullMsg.includes('Closing session: SessionEntry') || fullMsg.includes('SessionEntry {')) {
+    return;
+  }
+  originalConsoleLog.apply(console, args);
+};
+
+const originalStdoutWrite = process.stdout.write.bind(process.stdout);
+process.stdout.write = function (chunk, encoding, callback) {
+  const str = typeof chunk === 'string' ? chunk : (Buffer.isBuffer(chunk) ? chunk.toString() : '');
+  if (str.includes('Closing session: SessionEntry') || str.includes('SessionEntry {')) {
+    if (typeof encoding === 'function') encoding();
+    else if (typeof callback === 'function') callback();
+    return true;
+  }
+  return originalStdoutWrite(chunk, encoding, callback);
+};
+
 
 try {
   if (typeof process.loadEnvFile === 'function') {
