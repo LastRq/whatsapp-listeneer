@@ -68,7 +68,8 @@ const FIRESTORE_STATUS_URL = `https://firestore.googleapis.com/v1/projects/${FIR
 const FIRESTORE_TELEMETRY_URL = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/settings/meta_telemetry`;
 
 // Configuración Supabase (Base de datos principal)
-const SUPABASE_URL = (process.env.SUPABASE_URL || 'https://txxjhpktsdopvuqsukhs.supabase.co').replace(/\/$/, '');
+const rawSupabaseUrl = (process.env.SUPABASE_URL || 'https://txxjhpktsdopvuqsukhs.supabase.co').trim();
+const SUPABASE_URL = rawSupabaseUrl.replace(/\/rest\/v1\/?$/i, '').replace(/\/+$/, '');
 const SUPABASE_KEY = process.env.SUPABASE_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || 'sb_publishable_1jFhFt49k_ary_YUg9tpBw_7ik8l81y';
 
 // Cargar credenciales dinámicamente para Meta Conversions API (CAPI) Business Messaging
@@ -687,7 +688,7 @@ async function saveLeadToFirestore({ name, phone, displayPhone, service, notes, 
         'apikey': SUPABASE_KEY,
         'Authorization': `Bearer ${SUPABASE_KEY}`,
         'Content-Type': 'application/json',
-        'Prefer': 'return=representation'
+        'Prefer': 'resolution=merge-duplicates'
       },
       body: JSON.stringify(supabasePayload)
     });
@@ -963,14 +964,21 @@ async function processIncomingMessage(sock, msg, contextSource = 'live', session
     const isOutboundTarget = isPhoneOutboundTracked(cleanPh, remoteJid);
     const lowerText = text.toLowerCase().trim();
 
-    // Detección de conversión comercial o clic en Anuncio de Meta Ads
+    // Detección de conversión comercial o mensaje legítimo entrante
     const isAdConversion = hasMetaAdReferral || 
-      lowerText.includes('quiero hablar con un asesor') || 
+      isAudio ||
+      isMedia ||
       lowerText.includes('asesor') || 
       lowerText.includes('cotizar') || 
       lowerText.includes('precio') || 
       lowerText.includes('informacion') || 
-      lowerText.includes('información');
+      lowerText.includes('información') ||
+      lowerText.includes('hola') ||
+      lowerText.includes('buenas') ||
+      lowerText.includes('buenos') ||
+      lowerText.includes('prueba') ||
+      lowerText.includes('test') ||
+      lowerText.length > 0; // Cualquier respuesta o mensaje entrante es capturado como prospecto válido
 
     if (isOutboundTarget && isAdConversion) {
       console.log(`🎯 [Conversión de Anuncio Detectada!] Contacto previamente en outbound ${pushName} (${displayPhone}) interactuó con anuncio: "${text}". Removiendo de lista de exclusión.`);
