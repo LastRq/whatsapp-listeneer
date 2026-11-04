@@ -923,8 +923,8 @@ async function processIncomingMessage(sock, msg, contextSource = 'live', session
       innerMessage?.buttonsResponseMessage
     );
 
-    // FILTRO ESTRICTO: Solo aceptar mensajes originados en anuncios de Meta Ads
-    const ONLY_META_ADS = process.env.ONLY_META_ADS !== 'false';
+    // FILTRO PUBLICITARIO: Solo filtrar si se especifica ONLY_META_ADS=true explícitamente en el entorno
+    const ONLY_META_ADS = process.env.ONLY_META_ADS === 'true';
     if (ONLY_META_ADS && !hasMetaAdReferral) {
       console.log(`🛡️ [Filtro Publicitario] Mensaje de ${pushName} (${displayPhone}) descartado: NO proviene de anuncio de Meta Ads.`);
       if (msgId) markMessageIdProcessed(msgId);
