@@ -42,7 +42,7 @@ try {
   await new Promise(resolve => server.once('listening', resolve));
   const base = 'http://127.0.0.1:' + server.address().port;
   const status = await (await network(base + '/api/status?tenant=kindev')).json();
-  assert.equal(status.version, 'tenant-ingestion-20261108-auth-baileys7');
+  assert.equal(status.version, 'tenant-ingestion-20261108-placeholder-recovery');
   assert.equal(status.ingestion.saved, 3);
   for (const route of ['/api/whatsapp/chat/593987654321?tenant=kindev', '/api/whatsapp/disconnect?tenant=kindev', '/api/whatsapp/outbound-tracker-full']) {
     assert.equal((await network(base + route)).status, 401);

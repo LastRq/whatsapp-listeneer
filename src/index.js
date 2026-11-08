@@ -7,11 +7,12 @@ import { fileURLToPath } from 'node:url';
 import makeWASocket, { useMultiFileAuthState, DisconnectReason } from '@whiskeysockets/baileys';
 import QRCode from 'qrcode';
 import pino from 'pino';
+import { createPlaceholderRecovery, recoverPeerMessages } from './placeholder-recovery.js';
 import { installAccountRoutes, verifyAccountRequest, authorizeTenant, verifyLinkTicket } from './account-auth.js';
 import { createDurableInbox } from './durable-inbox.js';
 import { createTenantIngestion, createSupabaseRequest, requireTenant, tenantKey } from './tenant-ingestion.js';
 import { loadTenantConfig, sendMetaEvent, installMetaRoutes } from './meta-integration.js';
-const RELEASE = 'tenant-ingestion-20261108-auth-baileys7';
+const RELEASE = 'tenant-ingestion-20261108-placeholder-recovery';
 const metrics = new Map();
 function metric(tenant, reason) {
   const state = metrics.get(tenant) || { received: 0, saved: 0, failed: 0, lastReceivedAt: null, lastSavedAt: null, reasons: {} };
@@ -741,6 +742,13 @@ async function saveLeadToFirestore(payload) {
   const result = await ingestion.save(payload);
   return result.saved;
 }
+const placeholderRecovery = createPlaceholderRecovery({
+  inbox: createDurableInbox(path.join(AUTH_DIR, 'placeholder-inbox')),
+  getSocket: tenant => sessions.get(tenant)?.connectionStatus === 'connected' ? sessions.get(tenant).sock : null,
+  onMetric: metric
+});
+setInterval(() => { void placeholderRecovery.retry(); }, 30000).unref();
+
 let retryingCapi = false;
 setInterval(async () => {
   if (retryingCapi) return;
@@ -831,8 +839,16 @@ async function processIncomingMessage(sock, msg, contextSource = 'live', session
   state.received++;
   state.lastReceivedAt = new Date().toISOString();
   addToRecentMessagesBuffer(msg, tenantId);
+  // Decode the receiving account's own primary-phone response BEFORE the
+  // outgoing-message filter. The original incoming metadata stays authoritative.
+  const recovered = recoverPeerMessages(msg, id => placeholderRecovery.original(tenantId, id));
+  for (const original of recovered) {
+    const result = await processIncomingMessage(sock, original, 'placeholder_recovery', tenantId);
+    if (result.saved) { placeholderRecovery.complete(tenantId, original.key.id); metric(tenantId, 'placeholder_recovered'); }
+  }
   const reject = reason => { metric(tenantId, reason); return { saved: false, reason }; };
   if (msg.key?.fromMe) {
+    if (msg.message?.protocolMessage) return reject('protocol_message');
     const timestamp = msg.messageTimestamp ? Number(msg.messageTimestamp) * 1000 : Date.now();
     if (Date.now() - timestamp < 72 * 3600000) {
       try {
@@ -853,7 +869,14 @@ async function processIncomingMessage(sock, msg, contextSource = 'live', session
   while (inner?.ephemeralMessage?.message || inner?.viewOnceMessage?.message || inner?.viewOnceMessageV2?.message || inner?.documentWithCaptionMessage?.message) {
     inner = inner.ephemeralMessage?.message || inner.viewOnceMessage?.message || inner.viewOnceMessageV2?.message || inner.documentWithCaptionMessage?.message;
   }
-  if (!inner) return reject('empty_payload');
+  if (!inner) {
+    if (msg.key?.id && msg.messageStubParameters?.[0] === 'Message absent from node') {
+      const record = placeholderRecovery.remember(tenantId, msg);
+      void placeholderRecovery.request(record);
+      return reject('placeholder_pending');
+    }
+    return reject('empty_payload');
+  }
   const text = inner.conversation || inner.extendedTextMessage?.text || inner.imageMessage?.caption || inner.videoMessage?.caption ||
     inner.documentMessage?.caption || inner.buttonsResponseMessage?.selectedDisplayText || inner.listResponseMessage?.title ||
     inner.templateButtonReplyMessage?.selectedDisplayText || inner.interactiveResponseMessage?.body?.text ||
@@ -871,6 +894,7 @@ async function processIncomingMessage(sock, msg, contextSource = 'live', session
     const result = await ingestion.save({ tenantId, phone, displayPhone: display, name: msg.pushName,
       message: text, messageId, adInfo, suppressMeta: /^prueba kindev 0811$/i.test(text.trim()), service: adInfo ? 'Anuncio Meta Ads WhatsApp' : 'Contacto Inicial WhatsApp' });
     if (scopedId) markMessageIdProcessed(scopedId);
+    if (messageId) placeholderRecovery.complete(tenantId, messageId);
     state.saved++;
     state.lastSavedAt = new Date().toISOString();
     state.lastError = null;
@@ -1207,14 +1231,34 @@ app.get('/api/whatsapp/diagnostics', async (req, res) => {
       rows.push({ idHash: crypto.createHash('sha256').update(msg.key?.id || '').digest('hex').slice(0, 12),
         timestamp: Number(msg.messageTimestamp || 0) * 1000, fromMe: Boolean(msg.key?.fromMe),
         remoteKind: remote.split('@')[1], phoneSuffix: resolved.phone?.slice(-4) || '',
-        messageTypes: Object.keys(msg.message || {}), stubType: msg.messageStubType,
+        messageTypes: Object.keys(msg.message || {}), protocolType: msg.message?.protocolMessage?.type,
+        peerResultKinds: msg.message?.protocolMessage?.peerDataOperationRequestResponseMessage?.peerDataOperationResult?.map(result => Object.keys(result)),
+        resendByteLengths: msg.message?.protocolMessage?.peerDataOperationRequestResponseMessage?.peerDataOperationResult?.map(result => result.placeholderMessageResendResponse?.webMessageInfoBytes?.length || 0), stubType: msg.messageStubType,
         stubReasons: (msg.messageStubParameters || []).map(value => String(value).replace(/\d{7,}/g, '[redacted]').slice(0, 120)) });
     }
     let creds = {};
     try { creds = JSON.parse(fs.readFileSync(path.join(session.authDir, 'creds.json'), 'utf8')); } catch {}
     res.json({ tenantId, version: RELEASE, status: session?.connectionStatus,
       phoneSuffix: session?.connectedUser?.slice(-4), hasLid: Boolean(creds.me?.lid),
-      isBuffering: sock?.ev?.isBuffering?.(), metrics: metrics.get(tenantId), messages: rows });
+      isBuffering: sock?.ev?.isBuffering?.(), pendingPlaceholders: placeholderRecovery.count(tenantId), metrics: metrics.get(tenantId), messages: rows });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+app.post('/api/whatsapp/recover-placeholder', async (req, res) => {
+  try {
+    const tenantId = requireTenant(req.body.tenantId);
+    const session = sessions.get(tenantId);
+    if (!session?.sock || session.connectionStatus !== 'connected') return res.status(409).json({ error: 'WhatsApp no está conectado.' });
+    const phone = cleanPhone(req.body.phone);
+    const id = String(req.body.messageId || '');
+    if (!/^\d{8,15}$/.test(phone) || !id || id.length > 200) return res.status(400).json({ error: 'Referencia de mensaje inválida.' });
+    const pn = phone + '@s.whatsapp.net';
+    const lid = await session.sock.signalRepository.lidMapping.getLIDForPN(pn);
+    const timestamp = Number(req.body.timestamp || Date.now());
+    const record = placeholderRecovery.remember(tenantId, { key: { id, remoteJid: lid || pn, remoteJidAlt: pn, fromMe: false },
+      messageTimestamp: timestamp > 1e12 ? Math.floor(timestamp / 1000) : timestamp });
+    await placeholderRecovery.request(record, true);
+    res.json({ success: true, tenantId, pending: placeholderRecovery.count(tenantId) });
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
