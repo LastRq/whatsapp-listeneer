@@ -9,7 +9,7 @@ import QRCode from 'qrcode';
 import pino from 'pino';
 import { createDurableInbox } from './durable-inbox.js';
 import { createTenantIngestion, createSupabaseRequest, requireTenant, tenantKey } from './tenant-ingestion.js';
-import { loadTenantConfig, sendMetaEvent } from './meta-integration.js';
+import { loadTenantConfig, sendMetaEvent, installMetaRoutes } from './meta-integration.js';
 const RELEASE = 'tenant-ingestion-20261108';
 const metrics = new Map();
 function metric(tenant, reason) {
@@ -174,6 +174,7 @@ async function dispatchCapiBusinessMessagingLead({ phone, name, remoteJid, text 
 
 app.use(cors());
 app.use(express.json({ limit: '256kb' }));
+installMetaRoutes(app);
 app.use('/api', (req, res, next) => {
   res.setHeader('Cache-Control', 'no-store');
   if (['/status', '/whatsapp/status'].includes(req.path)) return next();
@@ -1016,7 +1017,7 @@ async function startTenantWhatsAppBot(rawTenantId = 'kindev') {
       globalSock = sock;
     }
 
-    sock.ev.on('creds.update', saveCreds);
+    sock.ev.on('creds.update', () => { if (session.sock === sock) return saveCreds(); });
 
     sock.ev.on('connection.update', async (update) => {
       if (session.sock !== sock) return;
@@ -1624,6 +1625,36 @@ app.get('/api/whatsapp/disconnect', async (req, res) => {
     setTimeout(() => startTenantWhatsAppBot(tenantId), 2000);
   }
   res.redirect(`/qr?tenant=${encodeURIComponent(tenantId)}`);
+});
+
+// Re-link exactly one socket. Archive its keys; never move the shared AUTH_DIR.
+app.post('/api/whatsapp/relink', async (req, res) => {
+  try {
+    const tenantId = requireTenant(req.body?.tenantId);
+    const session = sessions.get(tenantId) || getOrCreateSession(tenantId);
+    clearTimeout(session.reconnectTimer);
+    const previousSocket = session.sock;
+    session.sock = null;
+    session.connectionStatus = 'initializing';
+    session.connectedUser = '';
+    session.qrCodeDataUrl = '';
+    previousSocket?.end(new Error('Relink requested for this account'));
+    await new Promise(resolve => setTimeout(resolve, 500));
+    const archive = path.join(AUTH_DIR, 'relink-backups', tenantId, String(Date.now()));
+    fs.mkdirSync(archive, { recursive: true, mode: 0o700 });
+    const authRoot = path.resolve(session.authDir);
+    let archivedFiles = 0;
+    for (const entry of fs.readdirSync(authRoot, { withFileTypes: true })) {
+      if (!entry.isFile() || !/^(creds\.json|(?:session|sender-key|pre-key|app-state-sync-key|app-state-sync-version|lid-mapping|device-list|tctoken)-.*\.json)$/.test(entry.name)) continue;
+      const source = path.resolve(authRoot, entry.name);
+      if (path.dirname(source) !== authRoot) throw new Error('Invalid auth file path');
+      fs.renameSync(source, path.join(archive, entry.name));
+      archivedFiles++;
+    }
+    session.starting = false;
+    await startTenantWhatsAppBot(tenantId);
+    res.json({ success: true, tenantId, archivedFiles, status: session.connectionStatus });
+  } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
 // 3. Webhook HTTP Universal de respaldo
