@@ -872,6 +872,14 @@ async function processIncomingMessage(sock, msg, contextSource = 'live', session
   if (!inner) {
     if (msg.key?.id && msg.messageStubParameters?.[0] === 'Message absent from node') {
       const record = placeholderRecovery.remember(tenantId, msg);
+      try {
+        const { phone, display } = await resolveRealPhone(sock, msg, sessions.get(tenantId)?.authDir || getTenantAuthDir(tenantId));
+        if (phone && !isPhoneBlacklisted(phone, tenantId)) {
+          await ingestion.save({ tenantId, phone, displayPhone: display, name: msg.pushName, messageId: msg.key.id,
+            receivedAt: new Date(timestamp).toISOString(), placeholder: true });
+          state.saved++; state.lastSavedAt = new Date().toISOString(); metric(tenantId, 'placeholder_contact_saved');
+        }
+      } catch (error) { state.failed++; state.lastError = error.message; }
       void placeholderRecovery.request(record);
       return reject('placeholder_pending');
     }
@@ -892,7 +900,9 @@ async function processIncomingMessage(sock, msg, contextSource = 'live', session
     if (phone === ownPhone || isPhoneBlacklisted(phone, tenantId)) return reject('blacklisted_or_self');
     // Every genuine inbound chat is captured. Ads/outbound heuristics cannot discard a client's conversation.
     const result = await ingestion.save({ tenantId, phone, displayPhone: display, name: msg.pushName,
-      message: text, messageId, adInfo, suppressMeta: /^prueba kindev 0811$/i.test(text.trim()), service: adInfo ? 'Anuncio Meta Ads WhatsApp' : 'Contacto Inicial WhatsApp' });
+      message: text, messageId, adInfo, receivedAt: new Date(timestamp).toISOString(),
+      suppressMeta: contextSource === 'history_sync' || /^prueba kindev 0811$/i.test(text.trim()),
+      suppressReason: contextSource === 'history_sync' ? 'history_recovery' : 'operator_test', service: adInfo ? 'Anuncio Meta Ads WhatsApp' : 'Contacto Inicial WhatsApp' });
     if (scopedId) markMessageIdProcessed(scopedId);
     if (messageId) placeholderRecovery.complete(tenantId, messageId);
     state.saved++;

@@ -21,13 +21,24 @@ export function createTenantIngestion({ request, inbox, mirror = async () => {},
       const rows = await request('leads?tenant_id=eq.' + encodeURIComponent(tenant) + '&phone=in.(' + phone + ',%2B' + phone + ')&select=*&order=created_at.asc&limit=1');
       const existing = rows[0];
       const timestamp = now();
-      const marker = payload.messageId ? '[wa:' + payload.messageId + ']' : '';
-      if (existing && marker && String(existing.notes || '').includes(marker)) return { saved: true, created: false, id: existing.id };
-      const message = String(payload.notes || payload.message || '').slice(0, 1200);
-      const notes = [existing?.notes, timestamp + ' ' + marker + ' ' + message].filter(Boolean).join('\n').slice(-10000);
+      const ids = Array.isArray(existing?.whatsapp_message_ids) ? existing.whatsapp_message_ids : [];
+      if (!payload.placeholder && existing && payload.messageId && ids.includes(payload.messageId)) return { saved: true, created: false, id: existing.id };
+      const confirmedIds = !payload.placeholder && payload.messageId ? [...ids, payload.messageId].slice(-200) : ids;
+      const pending = new Set(existing?.whatsapp_delivery?.pendingIds || []);
+      if (payload.messageId) { if (payload.placeholder) pending.add(payload.messageId); else pending.delete(payload.messageId); }
+      const delivery = { status: pending.size ? 'pending' : 'available', pendingIds: [...pending].slice(-200), updatedAt: timestamp };
+      const pendingLabel = '[WhatsApp: contenido pendiente de recuperación]';
+      const previousNotes = String(existing?.notes || '').replace(pendingLabel, '').trim();
+      const message = payload.placeholder ? '' : String(payload.notes || payload.message || '').slice(0, 1200);
+      const notes = [previousNotes, message ? timestamp + ' ' + message : '', pending.size ? pendingLabel : ''].filter(Boolean).join('\n').slice(-10000);
+      const resumeMeta = !payload.placeholder && existing?.meta_delivery?.status === 'waiting_message';
+      const metaDelivery = payload.placeholder ? { status: 'waiting_message', eventId: existing?.event_id }
+        : payload.suppressMeta ? { status: 'skipped', reason: payload.suppressReason || 'operator_test', eventId: existing?.event_id }
+        : { status: 'pending', eventId: existing?.event_id };
       let lead;
       if (existing) {
-        const patch = { notes, last_contact_date: timestamp,
+        const patch = { notes, last_contact_date: timestamp, whatsapp_message_ids: confirmedIds, whatsapp_delivery: delivery,
+          ...(resumeMeta ? { meta_delivery: metaDelivery } : {}),
           ...(existing.outbound_tracking?.firstSentAt ? { outbound_tracking: { ...existing.outbound_tracking,
             replyCount: (existing.outbound_tracking.replyCount || 0) + 1, lastReplyAt: Date.parse(timestamp) } } : {}),
           ...(payload.adInfo?.ctwaClid && !existing.ctwa_clid ? { ctwa_clid: payload.adInfo.ctwaClid } : {}) };
@@ -39,17 +50,18 @@ export function createTenantIngestion({ request, inbox, mirror = async () => {},
         const eventId = 'wa_lead_' + id;
         lead = { id, tenant_id: tenant, phone, display_phone: payload.displayPhone || '+' + phone,
           name: String(payload.name || 'Cliente WhatsApp').slice(0, 100), service: payload.service || 'Contacto Inicial WhatsApp',
-          notes, status: 'prospecto', amount: 0, created_at: timestamp, last_contact_date: timestamp,
+          notes, status: 'prospecto', amount: 0, created_at: payload.receivedAt || timestamp, last_contact_date: timestamp,
+          whatsapp_message_ids: confirmedIds, whatsapp_delivery: delivery,
           source: 'whatsapp_auto', event_id: eventId, meta_events: [],
           ...(payload.adInfo?.ctwaClid ? { ctwa_clid: payload.adInfo.ctwaClid } : {}),
-          meta_delivery: payload.suppressMeta ? { status: 'skipped', reason: 'operator_test', eventId } : { status: 'pending', eventId } };
+          meta_delivery: { ...metaDelivery, eventId } };
         const inserted = await request('leads', { method: 'POST', body: lead });
         if (!inserted.length) throw new Error('No se confirmó la creación del contacto.');
         lead = inserted[0];
       }
       // CRM capture succeeds independently of Firebase quota or Meta availability.
       Promise.resolve().then(() => mirror(lead)).catch(e => console.warn('[Mirror]', e.message));
-      if (!existing && !payload.suppressMeta) Promise.resolve().then(() => deliver(lead)).catch(e => console.warn('[CAPI]', e.message));
+      if ((!existing || resumeMeta) && !payload.placeholder && !payload.suppressMeta) Promise.resolve().then(() => deliver(lead)).catch(e => console.warn('[CAPI]', e.message));
       return { saved: true, created: !existing, id: lead.id };
     });
     locks.set(key, operation);

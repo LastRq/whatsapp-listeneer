@@ -33,3 +33,20 @@ test('pending placeholders and retries stay isolated by account even with the sa
   assert.equal(recovery.count('client_a'), 0); assert.equal(recovery.count('client_b'), 1);
   assert.equal(records.size, 1);
 });
+test('alternate lookup preserves the original sender and latest-history cursor uses milliseconds', async () => {
+  let timestamp = 1794170000000;
+  const inbox = { pending: () => [], put: () => 'receipt', remove: () => {} };
+  const requested = []; const history = [];
+  const recovery = createPlaceholderRecovery({ inbox, now: () => timestamp, getSocket: () => ({
+    requestPlaceholderResend: async (key, metadata) => requested.push({ key, metadata }),
+    fetchMessageHistory: async (...args) => history.push(args)
+  }) });
+  const record = recovery.remember('kindev', original);
+  await recovery.request(record);
+  timestamp += 31000;
+  await recovery.request(record);
+  assert.equal(requested[1].key.remoteJid, original.key.remoteJidAlt);
+  assert.equal(requested[1].metadata.key.remoteJid, original.key.remoteJid);
+  assert.equal(history[0][2], timestamp);
+  assert.equal(history[0][1].id, undefined);
+});

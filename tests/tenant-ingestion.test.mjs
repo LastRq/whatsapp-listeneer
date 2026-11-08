@@ -42,7 +42,8 @@ test('concurrent messages preserve both messages and create one lead', async () 
   const h = harness();
   await Promise.all(['A', 'B', 'C'].map(messageId => h.ingestion.save({ ...contact, tenantId: 'kindev', messageId })));
   assert.equal(h.rows.length, 1);
-  for (const id of ['A', 'B', 'C']) assert.ok(h.rows[0].notes.includes('[wa:' + id + ']'));
+  assert.deepEqual(h.rows[0].whatsapp_message_ids, ['A', 'B', 'C']);
+  assert.doesNotMatch(h.rows[0].notes, /\[wa:/);
   assert.equal(h.events.length, 1);
 });
 test('replaying a confirmed message does not append its text again', async () => {
@@ -72,4 +73,28 @@ test('Supabase errors and empty writes are never accepted as successful writes',
   await assert.rejects(request('leads', { method: 'POST', body: {} }));
   const empty = createTenantIngestion({ request: async () => [] });
   await assert.rejects(empty.save({ ...contact, tenantId: 'kindev' }));
+});
+test('a real incoming placeholder creates a visible contact and the same id later accepts its content', async () => {
+  const h = harness();
+  const payload = { ...contact, tenantId: 'kindev', messageId: 'P', receivedAt: '2026-11-08T19:00:00.000Z' };
+  await h.ingestion.save({ ...payload, placeholder: true });
+  assert.equal(h.rows.length, 1); assert.equal(h.events.length, 0);
+  assert.equal(h.rows[0].meta_delivery.status, 'waiting_message');
+  assert.match(h.rows[0].notes, /contenido pendiente/);
+  assert.deepEqual(h.rows[0].whatsapp_message_ids, []);
+  const id = h.rows[0].id;
+  await h.ingestion.save({ ...payload, message: 'Contenido real recuperado' });
+  assert.equal(h.rows[0].id, id); assert.equal(h.rows[0].created_at, payload.receivedAt);
+  assert.match(h.rows[0].notes, /Contenido real recuperado/);
+  assert.doesNotMatch(h.rows[0].notes, /contenido pendiente/);
+  assert.deepEqual(h.rows[0].whatsapp_message_ids, ['P']);
+  assert.equal(h.events.length, 1);
+});
+test('history and diagnostic recovery save content without sending a new production conversion', async () => {
+  const h = harness();
+  await h.ingestion.save({ ...contact, tenantId: 'kindev', messageId: 'P', placeholder: true });
+  await h.ingestion.save({ ...contact, tenantId: 'kindev', messageId: 'P', suppressMeta: true, suppressReason: 'history_recovery' });
+  assert.equal(h.events.length, 0);
+  assert.equal(h.rows[0].meta_delivery.status, 'skipped');
+  assert.equal(h.rows[0].meta_delivery.reason, 'history_recovery');
 });

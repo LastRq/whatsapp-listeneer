@@ -50,9 +50,12 @@ export function createPlaceholderRecovery({ inbox, getSocket, onMetric = () => {
       // Some primary-phone versions look up message keys by PN rather than LID.
       // If single-message recovery is insufficient, request this own chat's
       // actual earlier history. The normal per-socket history handler ingests it.
-      if (record.attempts >= 2 && !record.historyRequested && sock.fetchMessageHistory) {
-        await sock.fetchMessageHistory(20, requestKey, record.messageTimestamp);
-        record.historyRequested = true;
+      if (record.attempts >= 2 && record.historyRequestVersion !== 2 && sock.fetchMessageHistory) {
+        // The protocol field is milliseconds, not a WebMessageInfo seconds timestamp.
+        // An omitted message id requests the current tail of the known own chat.
+        const historyKey = { ...requestKey, remoteJid: alternate?.endsWith('@s.whatsapp.net') ? alternate : requestKey.remoteJid, id: undefined };
+        await sock.fetchMessageHistory(50, historyKey, now());
+        record.historyRequestVersion = 2;
         inbox.put(record);
         onMetric(record.tenantId, 'placeholder_history_requested');
       }
