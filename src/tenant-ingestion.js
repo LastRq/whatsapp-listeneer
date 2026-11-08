@@ -1,0 +1,79 @@
+import crypto from 'node:crypto';
+
+export function requireTenant(value) {
+  if (typeof value !== 'string' || !/^[a-z0-9][a-z0-9_-]{0,79}$/.test(value)) throw new Error('Cuenta inválida o ausente.');
+  return value;
+}
+
+// The phone, message id and lock always belong to the receiving socket's tenant.
+export const tenantKey = (tenant, value) => JSON.stringify([requireTenant(tenant), String(value)]);
+
+export function createTenantIngestion({ request, inbox, mirror = async () => {}, deliver = async () => {}, now = () => new Date().toISOString() }) {
+  const locks = new Map();
+  async function save(payload) {
+    const tenant = requireTenant(payload.tenantId);
+    const phone = String(payload.phone || '').replace(/\D/g, '');
+    if (!/^\d{8,15}$/.test(phone)) throw new Error('Número de WhatsApp no válido.');
+    const key = tenantKey(tenant, phone);
+    const receipt = inbox?.put(payload);
+    const previous = locks.get(key) || Promise.resolve();
+    const operation = previous.catch(() => {}).then(async () => {
+      const rows = await request('leads?tenant_id=eq.' + encodeURIComponent(tenant) + '&phone=in.(' + phone + ',%2B' + phone + ')&select=*&order=created_at.asc&limit=1');
+      const existing = rows[0];
+      const timestamp = now();
+      const marker = payload.messageId ? '[wa:' + payload.messageId + ']' : '';
+      if (existing && marker && String(existing.notes || '').includes(marker)) return { saved: true, created: false, id: existing.id };
+      const message = String(payload.notes || payload.message || '').slice(0, 1200);
+      const notes = [existing?.notes, timestamp + ' ' + marker + ' ' + message].filter(Boolean).join('\n').slice(-10000);
+      let lead;
+      if (existing) {
+        const patch = { notes, last_contact_date: timestamp,
+          ...(payload.adInfo?.ctwaClid && !existing.ctwa_clid ? { ctwa_clid: payload.adInfo.ctwaClid } : {}) };
+        const updated = await request('leads?id=eq.' + encodeURIComponent(existing.id) + '&tenant_id=eq.' + encodeURIComponent(tenant), { method: 'PATCH', body: patch });
+        if (!updated.length) throw new Error('No se confirmó la actualización del contacto.');
+        lead = updated[0];
+      } else {
+        const id = 'wa_' + crypto.createHash('sha256').update(key).digest('hex').slice(0, 40);
+        const eventId = 'wa_lead_' + id;
+        lead = { id, tenant_id: tenant, phone, display_phone: payload.displayPhone || '+' + phone,
+          name: String(payload.name || 'Cliente WhatsApp').slice(0, 100), service: payload.service || 'Contacto Inicial WhatsApp',
+          notes, status: 'prospecto', amount: 0, created_at: timestamp, last_contact_date: timestamp,
+          source: 'whatsapp_auto', event_id: eventId, meta_events: [],
+          ...(payload.adInfo?.ctwaClid ? { ctwa_clid: payload.adInfo.ctwaClid } : {}),
+          meta_delivery: { status: 'pending', eventId } };
+        const inserted = await request('leads', { method: 'POST', body: lead });
+        if (!inserted.length) throw new Error('No se confirmó la creación del contacto.');
+        lead = inserted[0];
+      }
+      // CRM capture succeeds independently of Firebase quota or Meta availability.
+      Promise.resolve().then(() => mirror(lead)).catch(e => console.warn('[Mirror]', e.message));
+      if (!existing) Promise.resolve().then(() => deliver(lead)).catch(e => console.warn('[CAPI]', e.message));
+      return { saved: true, created: !existing, id: lead.id };
+    });
+    locks.set(key, operation);
+    try {
+      const result = await operation;
+      if (receipt) inbox.remove(receipt);
+      return result;
+    }
+    finally { if (locks.get(key) === operation) locks.delete(key); }
+  }
+  return { save, async drain() {
+    for (const payload of inbox?.pending() || []) {
+      try { await save(payload); } catch (e) { console.warn('[Inbox:' + payload.tenantId + ']', e.message); }
+    }
+  } };
+}
+
+export function createSupabaseRequest(base, key, fetcher = fetch) {
+  if (!key || key.startsWith('sb_publishable_')) throw new Error('El servidor necesita la clave privada de Supabase.');
+  return async (resource, options = {}) => {
+    const response = await fetcher(base + '/rest/v1/' + resource, {
+      method: options.method || 'GET', headers: { apikey: key, Authorization: 'Bearer ' + key,
+        'Content-Type': 'application/json', Prefer: 'return=representation' },
+      ...(options.body ? { body: JSON.stringify(options.body) } : {}), signal: AbortSignal.timeout(15000)
+    });
+    if (!response.ok) throw new Error('Supabase no confirmó el guardado/lectura (' + response.status + ').');
+    return response.status === 204 ? [] : response.json();
+  };
+}

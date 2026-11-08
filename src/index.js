@@ -7,6 +7,18 @@ import { fileURLToPath } from 'node:url';
 import makeWASocket, { useMultiFileAuthState, DisconnectReason } from '@whiskeysockets/baileys';
 import QRCode from 'qrcode';
 import pino from 'pino';
+import { createDurableInbox } from './durable-inbox.js';
+import { createTenantIngestion, createSupabaseRequest, requireTenant, tenantKey } from './tenant-ingestion.js';
+import { loadTenantConfig, sendMetaEvent } from './meta-integration.js';
+const RELEASE = 'tenant-ingestion-20261108';
+const metrics = new Map();
+function metric(tenant, reason) {
+  const state = metrics.get(tenant) || { received: 0, saved: 0, failed: 0, lastReceivedAt: null, lastSavedAt: null, reasons: {} };
+  state.reasons[reason] = (state.reasons[reason] || 0) + 1;
+  metrics.set(tenant, state);
+  return state;
+}
+
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -161,7 +173,17 @@ async function dispatchCapiBusinessMessagingLead({ phone, name, remoteJid, text 
 }
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '256kb' }));
+app.use('/api', (req, res, next) => {
+  res.setHeader('Cache-Control', 'no-store');
+  if (['/status', '/whatsapp/status'].includes(req.path)) return next();
+  const expected = process.env.ADMIN_KEY || process.env['ADMIN-KEY'];
+  const supplied = String(req.headers['x-admin-key'] || '');
+  if (!expected || Buffer.byteLength(supplied) !== Buffer.byteLength(expected) || !crypto.timingSafeEqual(Buffer.from(supplied), Buffer.from(expected))) {
+    return res.status(401).json({ error: 'Se requiere autorización del administrador.' });
+  }
+  next();
+});
 app.use(express.static(path.join(__dirname, 'dist')));
 
 // Helper para limpiar teléfono celular ecuatoriano o internacional
@@ -177,7 +199,7 @@ function cleanPhone(raw) {
 }
 
 // Helper para resolver el número de teléfono real del remitente (desenmascarando LIDs de Meta Ads)
-async function resolveRealPhone(sock, msg) {
+async function resolveRealPhone(sock, msg, authDir) {
   const remoteJid = msg.key?.remoteJid || '';
   if (!remoteJid) return { phone: '', display: '' };
 
@@ -204,7 +226,7 @@ async function resolveRealPhone(sock, msg) {
   // 3. Si aún no está resuelto y es un LID, consultar archivo de mapeo inverso en auth_baileys
   if (!resolved && remoteJid.endsWith('@lid')) {
     const lidUser = remoteJid.split('@')[0].split(':')[0];
-    const reverseFile = path.join(AUTH_DIR, `lid-mapping-${lidUser}_reverse.json`);
+    const reverseFile = path.join(authDir, `lid-mapping-${lidUser}_reverse.json`);
     
     // Si el archivo aún se está escribiendo, dar una breve pausa de 350ms
     if (!fs.existsSync(reverseFile)) {
@@ -229,9 +251,7 @@ async function resolveRealPhone(sock, msg) {
   }
 
   // 5. Si después de todo aún no se pudo resolver, usar fallback
-  if (!resolved) {
-    resolved = remoteJid.split('@')[0].split(':')[0];
-  }
+  if (!resolved) return { phone: '', display: '' };
 
   // Limpiar número y formatear
   const clean = cleanPhone(resolved);
@@ -493,7 +513,7 @@ function isPhoneBlacklisted(phone, tenantId) {
   return blacklistData.some(b => {
     const bClean = cleanPhone(b.cleanPhone || b.phone || '');
     const matchPhone = bClean === clean || (clean && bClean && (clean.endsWith(bClean) || bClean.endsWith(clean)));
-    const matchTenant = !b.tenantId || b.tenantId === safeTenant || safeTenant === 'kindev';
+    const matchTenant = (b.tenantId || 'kindev') === safeTenant;
     return matchPhone && matchTenant;
   });
 }
@@ -539,7 +559,7 @@ function removeFromBlacklist(phone, tenantId) {
   const clean = cleanPhone(phone);
   const safeTenant = sanitizeTenantId(tenantId || 'kindev');
   loadBlacklist();
-  blacklistData = blacklistData.filter(b => !(cleanPhone(b.cleanPhone || b.phone) === clean && (!b.tenantId || b.tenantId === safeTenant)));
+  blacklistData = blacklistData.filter(b => !(cleanPhone(b.cleanPhone || b.phone) === clean && ((b.tenantId || 'kindev') === safeTenant)));
   saveBlacklist();
 
   fetch(`${SUPABASE_URL}/rest/v1/blacklist?clean_phone=eq.${encodeURIComponent(clean)}&tenant_id=eq.${encodeURIComponent(safeTenant)}`, {
@@ -665,178 +685,62 @@ async function syncFirestoreExistingLeadsCache(force = false) {
 }
 
 // Sincronizar al arrancar y cada 6 horas (optimizado para no consumir la cuota gratuita de Firestore)
-syncFirestoreExistingLeadsCache();
-setInterval(syncFirestoreExistingLeadsCache, 6 * 60 * 60 * 1000);
+// Ingestion queries Supabase by tenant and phone; legacy disk cache is not authoritative.
 
 // Helper unificado para guardar leads en Cloud Firestore con PROTECCIÓN TOTAL DE DUPLICADOS
-async function saveLeadToFirestore({ name, phone, displayPhone, service, notes, source, tenantId = TENANT_ID, eventId }) {
-  const cleanPh = cleanPhone(phone);
-  if (!cleanPh) return false;
-
-  // 1. VERIFICACIÓN ANTI-DUPLICADOS ESTRICTA (Protege clientes existentes y en vuelo)
-  const existingLead = existingFirestoreLeadsByPhone.get(cleanPh);
-  if (existingLead) {
-    // Si la creación inicial aún está en vuelo por concurrencia, esperar hasta 2s para que tenga ID real
-    if (existingLead.id && existingLead.id.startsWith('pending_')) {
-      let waitCount = 0;
-      while (existingLead.id && existingLead.id.startsWith('pending_') && waitCount < 20) {
-        await new Promise((r) => setTimeout(r, 100));
-        waitCount++;
-      }
-    }
-
-    if (existingLead.id && !existingLead.id.startsWith('pending_')) {
-      console.log(`🛡️ [Anti-Duplicados] Cliente existente detectado: "${existingLead.name}" (+${cleanPh}) [Estado: ${existingLead.status}]. Actualizando datos sin duplicar documento.`);
-      try {
-        const cleanNotes = notes && notes !== 'Mensaje: ""' ? notes : '';
-        const updatedNotes = existingLead.notes 
-          ? (cleanNotes ? `${existingLead.notes}\n[Nuevo mensaje WhatsApp ${new Date().toLocaleTimeString()}]: "${cleanNotes}"` : existingLead.notes)
-          : cleanNotes;
-        
-        const shouldUpgradeService = service && service.includes('Meta Ads') && (!existingLead.service || !existingLead.service.includes('Meta Ads'));
-
-        // 1. Supabase PATCH (Base de datos principal)
-        try {
-          await fetch(`${SUPABASE_URL}/rest/v1/leads?id=eq.${encodeURIComponent(existingLead.id)}`, {
-            method: 'PATCH',
-            headers: {
-              'apikey': SUPABASE_KEY,
-              'Authorization': `Bearer ${SUPABASE_KEY}`,
-              'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-              notes: updatedNotes.slice(0, 1500),
-              last_contact_date: new Date().toISOString(),
-              ...(shouldUpgradeService ? { service } : {})
-            })
-          });
-        } catch (sbErr) {
-          console.warn('⚠️ Supabase lead patch warn:', sbErr.message);
-        }
-
-        // 2. Firestore PATCH en segundo plano
-        let fieldPaths = 'updateMask.fieldPaths=notes&updateMask.fieldPaths=lastContactDate';
-        const patchFields = {
-          notes: { stringValue: updatedNotes.slice(0, 1500) },
-          lastContactDate: { stringValue: new Date().toISOString() }
-        };
-
-        if (shouldUpgradeService) {
-          fieldPaths += '&updateMask.fieldPaths=service';
-          patchFields.service = { stringValue: service };
-          existingLead.service = service;
-        }
-
-        const patchUrl = `${FIRESTORE_REST_URL}/${existingLead.id}?${fieldPaths}`;
-        fetch(patchUrl, {
-          method: 'PATCH',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ fields: patchFields })
-        }).catch(() => {});
-
-        existingLead.notes = updatedNotes;
-        return true;
-      } catch (patchErr) {
-        console.error('Error actualizando cliente existente:', patchErr.message);
-        return false;
-      }
-    }
-  }
-
-  // 2. Si no existe, RESERVAR INMEDIATAMENTE en memoria para abortar cualquier concurrencia simultánea
-  const newId = `lead_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-  existingFirestoreLeadsByPhone.set(cleanPh, {
-    id: newId,
-    name: name || 'Cliente WhatsApp',
-    status: 'prospecto',
-    amount: 0,
-    notes: notes || '',
-    service: service || 'Contacto Inicial WhatsApp'
-  });
-  markPhoneProcessed(cleanPh);
-
-  let savedOk = false;
-
-  // 2.1 Guardar en Supabase (Base de datos principal)
+const databaseRequest = createSupabaseRequest(SUPABASE_URL, SUPABASE_KEY);
+async function deliverTenantLead(lead) {
   try {
-    const supabasePayload = {
-      id: newId,
-      name: name || 'Cliente WhatsApp',
-      phone: cleanPh,
-      display_phone: displayPhone || cleanPh,
-      service: service || 'Contacto Inicial WhatsApp',
-      notes: notes || '',
-      status: 'prospecto',
-      amount: 0,
-      created_at: new Date().toISOString(),
-      source: source || 'whatsapp_auto',
-      tenant_id: String(tenantId),
-      event_id: eventId || `wa_${cleanPh}_${Date.now()}`
-    };
-
-    const sbRes = await fetch(`${SUPABASE_URL}/rest/v1/leads`, {
-      method: 'POST',
-      headers: {
-        'apikey': SUPABASE_KEY,
-        'Authorization': `Bearer ${SUPABASE_KEY}`,
-        'Content-Type': 'application/json',
-        'Prefer': 'resolution=merge-duplicates'
-      },
-      body: JSON.stringify(supabasePayload)
+    const config = await loadTenantConfig(lead.tenant_id);
+    const result = await sendMetaEvent({ eventName: 'Lead', phone: lead.phone, name: lead.name,
+      leadId: lead.id, eventId: lead.event_id, eventTime: Math.floor(new Date(lead.created_at).getTime() / 1000),
+      actionSource: 'business_messaging', ctwaClid: lead.ctwa_clid }, config);
+    const event = { eventName: 'Lead', date: new Date().toISOString(), eventId: lead.event_id,
+      tenantId: lead.tenant_id, datasetId: result.datasetId, fbtraceId: result.fbtraceId,
+      testMode: result.testMode, eventsReceived: result.eventsReceived, actionSource: result.actionSource };
+    const rows = await databaseRequest('leads?id=eq.' + encodeURIComponent(lead.id) + '&tenant_id=eq.' + encodeURIComponent(lead.tenant_id) + '&select=meta_events');
+    await databaseRequest('leads?id=eq.' + encodeURIComponent(lead.id) + '&tenant_id=eq.' + encodeURIComponent(lead.tenant_id), {
+      method: 'PATCH', body: { meta_events: [...(rows[0]?.meta_events || []), event],
+        meta_delivery: { status: 'accepted', eventId: lead.event_id, checkedAt: event.date, traceId: result.fbtraceId } }
     });
-
-    if (sbRes.ok) {
-      savedOk = true;
-      console.log(`🎉 [Auto-Captura Supabase] Nuevo lead único ${name} (+${cleanPh}) guardado! (ID: ${newId})`);
-    } else {
-      console.warn('⚠️ Supabase insert response status:', sbRes.status, await sbRes.text());
-    }
-  } catch (sbErr) {
-    console.warn('⚠️ Supabase insert err:', sbErr.message);
-  }
-
-  // 2.2 Guardar en Firestore en segundo plano (sin bloquear si la cuota gratuita está excedida)
-  try {
-    const firestorePayload = {
-      fields: {
-        name: { stringValue: name || 'Cliente WhatsApp' },
-        phone: { stringValue: cleanPh },
-        displayPhone: { stringValue: displayPhone || cleanPh },
-        service: { stringValue: service || 'Contacto Inicial WhatsApp' },
-        notes: { stringValue: notes || '' },
-        status: { stringValue: 'prospecto' },
-        amount: { doubleValue: 0 },
-        createdAt: { stringValue: new Date().toISOString() },
-        source: { stringValue: source || 'whatsapp_auto' },
-        tenantId: { stringValue: String(tenantId) },
-        eventId: { stringValue: eventId || `wa_${cleanPh}_${Date.now()}` }
-      }
-    };
-
-    fetch(FIRESTORE_REST_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(firestorePayload)
-    }).then(async res => {
-      if (res.ok) {
-        console.log(`🎉 [Auto-Captura Firestore] Copia de respaldo guardada en Firestore (+${cleanPh})`);
-      }
-    }).catch(() => {});
-  } catch {}
-
-  if (savedOk) {
-    return true;
-  } else {
-    // Si Supabase falló temporalmente, mantener en memoria para no duplicar
-    return true;
+  } catch (error) {
+    await databaseRequest('leads?id=eq.' + encodeURIComponent(lead.id) + '&tenant_id=eq.' + encodeURIComponent(lead.tenant_id), {
+      method: 'PATCH', body: { meta_delivery: { status: 'pending', eventId: lead.event_id,
+        checkedAt: new Date().toISOString(), error: error.message } }
+    });
   }
 }
+const ingestion = createTenantIngestion({ request: databaseRequest, deliver: deliverTenantLead, inbox: createDurableInbox(path.join(AUTH_DIR, 'ingestion-inbox')) });
+setInterval(() => { void ingestion.drain(); }, 60000).unref();
+void ingestion.drain();
+async function saveLeadToFirestore(payload) {
+  const result = await ingestion.save(payload);
+  return result.saved;
+}
+let retryingCapi = false;
+setInterval(async () => {
+  if (retryingCapi) return;
+  retryingCapi = true;
+  try {
+    const rows = await databaseRequest('leads?meta_delivery->>status=eq.pending&order=created_at.asc&limit=30');
+    for (const lead of rows) {
+      if (Date.now() - new Date(lead.created_at).getTime() > 7 * 86400000) {
+        await databaseRequest('leads?id=eq.' + encodeURIComponent(lead.id) + '&tenant_id=eq.' + encodeURIComponent(lead.tenant_id), {
+          method: 'PATCH', body: { meta_delivery: { ...lead.meta_delivery, status: 'expired' } }
+        });
+      } else await deliverTenantLead(lead);
+    }
+  } catch (e) { console.warn('[CAPI retry]', e.message); }
+  finally { retryingCapi = false; }
+}, 30 * 60 * 1000).unref();
 
 // Buffer en memoria de mensajes recientes para consulta retroactiva (últimos 300)
 const recentMessagesBuffer = [];
-function addToRecentMessagesBuffer(msg) {
+function addToRecentMessagesBuffer(msg, tenantId) {
   if (!msg?.key?.id) return;
-  recentMessagesBuffer.unshift(msg);
+  const index = recentMessagesBuffer.findIndex(m => m._tenantId === tenantId && m.key?.id === msg.key.id);
+  if (index >= 0) recentMessagesBuffer.splice(index, 1);
+  recentMessagesBuffer.unshift({ ...msg, _tenantId: tenantId });
   if (recentMessagesBuffer.length > 300) recentMessagesBuffer.pop();
 }
 
@@ -897,311 +801,70 @@ function extractMetaAdInfo(msg) {
   return null;
 }
 
-async function processIncomingMessage(sock, msg, contextSource = 'live', sessionTenantId = 'kindev') {
-  if (!msg) return { saved: false, reason: 'no_msg' };
-  addToRecentMessagesBuffer(msg);
-
-  // 1. Mensajes salientes: registrar automáticamente en Outbound Tracker SOLO si es prospección fría (no cliente ni conversación existente)
-  if (msg.key?.fromMe) {
-    const remoteJid = msg.key.remoteJid || '';
-    if (remoteJid && !remoteJid.endsWith('@g.us') && !remoteJid.includes('status')) {
-      const rawUser = remoteJid.split('@')[0].split(':')[0];
-      const clean = cleanPhone(rawUser);
-      let text =
-        msg.message?.conversation ||
-        msg.message?.extendedTextMessage?.text ||
-        '';
-
-      let mappedPhone = '';
-      if (remoteJid.endsWith('@lid')) {
-        const reverseFile = path.join(AUTH_DIR, `lid-mapping-${rawUser}_reverse.json`);
-        if (fs.existsSync(reverseFile)) {
-          try {
-            mappedPhone = cleanPhone(JSON.parse(fs.readFileSync(reverseFile, 'utf8')));
-          } catch (e) {}
-        }
-      }
-
-      const isKnownLead = (clean && existingFirestoreLeadsByPhone.has(clean)) ||
-                          (rawUser && existingFirestoreLeadsByPhone.has(rawUser)) ||
-                          (mappedPhone && existingFirestoreLeadsByPhone.has(mappedPhone));
-
-      const hasInboundMessage = recentMessagesBuffer.some(m =>
-        !m.key?.fromMe && (
-          m.key?.remoteJid === remoteJid ||
-          (clean && m.key?.remoteJid?.includes(clean)) ||
-          (mappedPhone && m.key?.remoteJid?.includes(mappedPhone))
-        )
-      );
-
-      // Si NO es un lead conocido y NO es una respuesta a un cliente entrante, es outbound frío
-      if (!isKnownLead && !hasInboundMessage) {
-        recordOutboundMessage(rawUser, text);
-        if (clean) recordOutboundMessage(clean, text);
-        if (mappedPhone) recordOutboundMessage(mappedPhone, text);
-      }
-    }
-    return { saved: false, reason: 'from_me' };
-  }
-
-  // 2. Descartar grupos o estados de WhatsApp
+async function processIncomingMessage(sock, msg, contextSource = 'live', sessionTenantId) {
+  const tenantId = requireTenant(sessionTenantId);
+  const state = metric(tenantId, 'received');
+  state.received++;
+  state.lastReceivedAt = new Date().toISOString();
+  addToRecentMessagesBuffer(msg, tenantId);
+  const reject = reason => { metric(tenantId, reason); return { saved: false, reason }; };
+  if (msg.key?.fromMe) return reject('from_me');
   const remoteJid = msg.key?.remoteJid || '';
-  if (!remoteJid || remoteJid.endsWith('@g.us') || remoteJid.includes('status')) {
-    return { saved: false, reason: 'group_or_status' };
+  if (!/@(s\.whatsapp\.net|lid)$/.test(remoteJid)) return reject('group_or_status');
+  const timestamp = msg.messageTimestamp ? Number(msg.messageTimestamp) * 1000 : Date.now();
+  if (Date.now() - timestamp > 72 * 3600000) return reject('too_old');
+  const messageId = msg.key?.id;
+  const scopedId = messageId ? tenantKey(tenantId, messageId) : '';
+  if (scopedId && isMessageIdProcessed(scopedId)) return reject('already_processed_msg');
+  let inner = msg.message;
+  while (inner?.ephemeralMessage?.message || inner?.viewOnceMessage?.message || inner?.viewOnceMessageV2?.message || inner?.documentWithCaptionMessage?.message) {
+    inner = inner.ephemeralMessage?.message || inner.viewOnceMessage?.message || inner.viewOnceMessageV2?.message || inner.documentWithCaptionMessage?.message;
   }
-
-  // 3. Ventana temporal: descartar mensajes de más de 72 horas para no traer historial antiguo
-  const msgTs = msg.messageTimestamp ? Number(msg.messageTimestamp) * 1000 : Date.now();
-  const maxAgeMs = 72 * 60 * 60 * 1000; // 72 horas
-  if (Date.now() - msgTs > maxAgeMs) {
-    return { saved: false, reason: 'too_old' };
-  }
-
-  // 4. Deduplicación estricta por ID único de mensaje
-  const msgId = msg.key?.id;
-  if (msgId && isMessageIdProcessed(msgId)) {
-    return { saved: false, reason: 'already_processed_msg' };
-  }
-
-  // 5. Desenmascarar número telefónico real (LID de Meta Ads o directo)
-  const { phone, display: displayPhone } = await resolveRealPhone(sock, msg);
-  if (!phone) return { saved: false, reason: 'invalid_phone' };
-  const cleanPh = cleanPhone(phone);
-  if (!cleanPh) return { saved: false, reason: 'invalid_phone' };
-
-  // 6. Lista de exclusión de números propios / administradores Y BLACKLIST (No es un cliente)
-  const targetTenantId = sessionTenantId || 'kindev';
-  if (EXCLUDED_PHONES.includes(cleanPh) || isPhoneBlacklisted(cleanPh, targetTenantId) || isPhoneBlacklisted(phone, targetTenantId)) {
-    console.log(`🚫 [Blacklist / Excluido] Mensaje de ${msg.pushName || 'Contacto'} (+${cleanPh}) descartado: pertenece a la lista negra (No es un cliente).`);
-    if (msgId) markMessageIdProcessed(msgId);
-    return { saved: false, reason: 'blacklisted_phone' };
-  }
-
-  // 7. Mutex concurrente: si hay un procesamiento activo para este teléfono, esperar
-  if (inFlightPhones.has(cleanPh)) {
-    console.log(`⏳ [Anti-Duplicados] Operación en curso para +${cleanPh}. Esperando resolución del mensaje previo...`);
-    let waited = 0;
-    while (inFlightPhones.has(cleanPh) && waited < 25) {
-      await new Promise((r) => setTimeout(r, 100));
-      waited++;
-    }
-  }
-
-  inFlightPhones.add(cleanPh);
-
+  if (!inner) return reject('empty_payload');
+  const text = inner.conversation || inner.extendedTextMessage?.text || inner.imageMessage?.caption || inner.videoMessage?.caption ||
+    inner.documentMessage?.caption || inner.buttonsResponseMessage?.selectedDisplayText || inner.listResponseMessage?.title ||
+    inner.templateButtonReplyMessage?.selectedDisplayText || inner.interactiveResponseMessage?.body?.text ||
+    (inner.audioMessage ? '[Audio recibido]' : '') ||
+    (inner.imageMessage || inner.videoMessage || inner.documentMessage || inner.stickerMessage ? '[Archivo multimedia recibido]' : '');
+  const adInfo = extractMetaAdInfo({ ...msg, message: inner });
+  if (!text.trim() && !adInfo) return reject('empty_payload');
   try {
-    // 8. Extraer contenido textual o multimedia del mensaje (desempaquetando capas)
-    let innerMessage = msg.message;
-    while (
-      innerMessage?.ephemeralMessage?.message ||
-      innerMessage?.viewOnceMessage?.message ||
-      innerMessage?.viewOnceMessageV2?.message ||
-      innerMessage?.documentWithCaptionMessage?.message
-    ) {
-      innerMessage =
-        innerMessage.ephemeralMessage?.message ||
-        innerMessage.viewOnceMessage?.message ||
-        innerMessage.viewOnceMessageV2?.message ||
-        innerMessage.documentWithCaptionMessage?.message;
-    }
-
-    const pushName = msg.pushName || 'Cliente WhatsApp';
-    let text =
-      innerMessage?.conversation ||
-      innerMessage?.extendedTextMessage?.text ||
-      innerMessage?.imageMessage?.caption ||
-      innerMessage?.videoMessage?.caption ||
-      innerMessage?.documentMessage?.caption ||
-      innerMessage?.buttonsResponseMessage?.selectedDisplayText ||
-      innerMessage?.buttonsResponseMessage?.selectedButtonId ||
-      innerMessage?.listResponseMessage?.title ||
-      innerMessage?.templateButtonReplyMessage?.selectedDisplayText ||
-      innerMessage?.templateButtonReplyMessage?.selectedId ||
-      innerMessage?.interactiveResponseMessage?.body?.text ||
-      '';
-
-    const isAudio = !!(innerMessage?.audioMessage);
-    const isMedia = !!(innerMessage?.imageMessage || innerMessage?.videoMessage || innerMessage?.documentMessage || innerMessage?.stickerMessage);
-
-    if (!text) {
-      if (isAudio) text = '[Nota de voz / Audio recibido]';
-      else if (isMedia) text = '[Archivo multimedia / Documento recibido]';
-    }
-
-    // 9. Detección exhaustiva de metadatos de Anuncio Meta Ads (CTWA)
-    const metaAdData = extractMetaAdInfo(msg);
-    const hasMetaAdReferral = Boolean(
-      metaAdData ||
-      innerMessage?.extendedTextMessage?.contextInfo?.externalAdReply ||
-      innerMessage?.extendedTextMessage?.contextInfo?.advertisementDetails ||
-      innerMessage?.extendedTextMessage?.contextInfo?.referral ||
-      innerMessage?.templateButtonReplyMessage ||
-      innerMessage?.buttonsResponseMessage
-    );
-
-    // FILTRO PUBLICITARIO: Solo filtrar si se especifica ONLY_META_ADS=true explícitamente en el entorno
-    const ONLY_META_ADS = process.env.ONLY_META_ADS === 'true';
-    if (ONLY_META_ADS && !hasMetaAdReferral) {
-      console.log(`🛡️ [Filtro Publicitario] Mensaje de ${pushName} (${displayPhone}) descartado: NO proviene de anuncio de Meta Ads.`);
-      if (msgId) markMessageIdProcessed(msgId);
-      return { saved: false, reason: 'not_meta_ad_referral' };
-    }
-
-    // 10. Descarte de paquetes vacíos (sin texto, sin audio, sin medios y sin referencia publicitaria)
-    if (!text.trim() && !isAudio && !isMedia && !hasMetaAdReferral) {
-      // OJO CRÍTICO: NUNCA marcar msgId como procesado en un paquete vacío/handshake,
-      // para permitir que el paquete subsiguiente con el payload real con el mismo ID sea procesado.
-      return { saved: false, reason: 'empty_ping_no_substance' };
-    }
-
-    // 11. Detección de contacto de prospección / script (OUTBOUND)
-    const isOutboundTarget = isPhoneOutboundTracked(cleanPh, remoteJid);
-    const lowerText = text.toLowerCase().trim();
-
-    // Detección de conversión comercial o mensaje legítimo entrante
-    const isAdConversion = hasMetaAdReferral || 
-      isAudio ||
-      isMedia ||
-      lowerText.includes('asesor') || 
-      lowerText.includes('cotizar') || 
-      lowerText.includes('precio') || 
-      lowerText.includes('informacion') || 
-      lowerText.includes('información') ||
-      lowerText.includes('hola') ||
-      lowerText.includes('buenas') ||
-      lowerText.includes('buenos') ||
-      lowerText.includes('prueba') ||
-      lowerText.includes('test') ||
-      lowerText.length > 0; // Cualquier respuesta o mensaje entrante es capturado como prospecto válido
-
-    if (isOutboundTarget && isAdConversion) {
-      console.log(`🎯 [Conversión de Anuncio Detectada!] Contacto previamente en outbound ${pushName} (${displayPhone}) interactuó con anuncio: "${text}". Removiendo de lista de exclusión.`);
-      outboundPhonesMap.delete(cleanPh);
-      if (remoteJid) outboundPhonesMap.delete(remoteJid.split('@')[0]);
-      scheduleSaveOutboundTracker();
-    }
-
-    // === REGLA ESTRICTA: NINGÚN CONTACTO DEL SCRIPT (OUTBOUND) SE AGREGA A FIRESTORE NI A CAPI, EXCEPTO SI CONVIERTE POR ANUNCIO ===
-    if (isOutboundTarget && !isAdConversion) {
-      console.log(`🛡️ [Outbound Script Bloqueado] Contacto de prospección ${pushName} (${displayPhone}): "${text}". Omitido rotundamente para no ensuciar el CRM.`);
-      if (msgId) markMessageIdProcessed(msgId);
-
-      const existingLead = existingFirestoreLeadsByPhone.get(cleanPh);
-      if (existingLead && (existingLead.status === 'cerrado' || existingLead.status === 'anticipo' || existingLead.amount > 0)) {
-        try {
-          const updatedNotes = existingLead.notes 
-            ? `${existingLead.notes}\n[WhatsApp ${new Date().toLocaleTimeString()}]: "${text}"`
-            : text;
-          // Supabase PATCH
-          fetch(`${SUPABASE_URL}/rest/v1/leads?id=eq.${encodeURIComponent(existingLead.id)}`, {
-            method: 'PATCH',
-            headers: {
-              'apikey': SUPABASE_KEY,
-              'Authorization': `Bearer ${SUPABASE_KEY}`,
-              'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-              notes: updatedNotes.slice(0, 1500),
-              last_contact_date: new Date().toISOString()
-            })
-          }).catch(() => {});
-
-          const patchUrl = `${FIRESTORE_REST_URL}/${existingLead.id}?updateMask.fieldPaths=notes&updateMask.fieldPaths=lastContactDate`;
-          fetch(patchUrl, {
-            method: 'PATCH',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              fields: {
-                notes: { stringValue: updatedNotes.slice(0, 1500) },
-                lastContactDate: { stringValue: new Date().toISOString() }
-              }
-            })
-          }).catch(() => {});
-          existingLead.notes = updatedNotes;
-        } catch (e) {}
-      }
-
-      return { saved: false, reason: 'outbound_script_blocked' };
-    }
-
-    // 12. Filtro de descarte de auto-respuestas de empresas / veterinarias / bots de prospección externa
-    const isBusinessAutoReply = BUSINESS_AUTOREPLY_PATTERNS.some(p => lowerText.includes(p));
-    if (isBusinessAutoReply) {
-      console.log(`🧹 [Auto-Respuesta / Prospección Externa Descartada] ${pushName} (${displayPhone}): "${text}". No se agrega a Firestore.`);
-      if (msgId) markMessageIdProcessed(msgId);
-      recordOutboundMessage(cleanPh || remoteJid.split('@')[0], text);
-      return { saved: false, reason: 'business_autoreply_discarded' };
-    }
-
-    // 13. Verificación de lead existente o recientemente procesado
-    const existingLead = existingFirestoreLeadsByPhone.get(cleanPh);
-    if (existingLead || isPhoneRecentlyProcessed(cleanPh)) {
-      console.log(`🛡️ [Anti-Duplicados] Lead ya registrado para +${cleanPh}. Anexando actividad sin duplicar documento.`);
-      if (msgId) markMessageIdProcessed(msgId);
-
-      // Si tenemos ficha existente y hay texto o anuncio de referencia, actualizar notas y servicio
-      if (existingLead) {
-        await saveLeadToFirestore({
-          name: pushName,
-          phone: cleanPh,
-          displayPhone,
-          service: hasMetaAdReferral ? 'Anuncio Meta Ads WhatsApp' : (existingLead.service || 'Contacto Inicial WhatsApp'),
-          notes: text ? `Mensaje: "${text}"` : '',
-          source: 'whatsapp_auto',
-          eventId: `wa_${cleanPh}_${Date.now()}`
-        });
-      }
-
-      return { saved: false, reason: 'phone_already_exists_updated' };
-    }
-
-    // === RAMA: CLIENTE INBOUND GENUINO Y NUEVO ===
-    console.log(`🚀 [Lead Inbound Detectado!] (${contextSource}) De: ${pushName} | Tel: ${displayPhone} (JID: ${remoteJid}) - "${text}"`);
-    markPhoneProcessed(cleanPh);
-
-    // B.1: Despacho a Meta CAPI (solo si viene por anuncio o inbound genuino)
-    const capiRes = await dispatchCapiBusinessMessagingLead({
-      phone: cleanPh || displayPhone,
-      name: pushName,
-      remoteJid,
-      text
-    });
-
-    // Detección automática de sesión y servicio (Campaña $50 Dr. Gabriel Miranda vs Kindev Web)
-    const cleanConnectedUser = cleanPhone(connectedUser);
-    const targetTenantId = sessionTenantId || 'kindev';
-    const isMirandaSession = targetTenantId.includes('miranda') || targetTenantId.includes('gabriel');
-
-    let autoService = hasMetaAdReferral ? 'Anuncio Meta Ads WhatsApp' : 'Contacto Inicial WhatsApp';
-    if (isMirandaSession) {
-      if (hasMetaAdReferral || lowerText.includes('50') || lowerText.includes('promo') || lowerText.includes('campaña') || lowerText.includes('campana')) {
-        autoService = 'Promoción Campaña ($50 USD)';
-      } else {
-        autoService = 'Consulta Odontológica WhatsApp';
-      }
-    }
-
-    // B.2: Guardar en Firestore con source: 'whatsapp_auto'
-    const saved = await saveLeadToFirestore({
-      name: pushName,
-      phone: cleanPh,
-      displayPhone,
-      service: autoService,
-      notes: `Mensaje: "${text}"`,
-      source: 'whatsapp_auto',
-      tenantId: targetTenantId,
-      eventId: capiRes?.eventId || `wa_${cleanPh}_${Date.now()}`
-    });
-
-    if (saved) {
-      if (msgId) markMessageIdProcessed(msgId);
-    }
-
-    return { saved, source: 'whatsapp_auto' };
-  } finally {
-    inFlightPhones.delete(cleanPh);
+    const authDir = sessions.get(tenantId)?.authDir || getTenantAuthDir(tenantId);
+    const { phone, display } = await resolveRealPhone(sock, msg, authDir);
+    if (!phone) return reject('unresolved_lid');
+    const ownPhone = cleanPhone(sock.user?.id?.split(':')[0]?.split('@')[0]);
+    if (phone === ownPhone || isPhoneBlacklisted(phone, tenantId)) return reject('blacklisted_or_self');
+    // Every genuine inbound chat is captured. Ads/outbound heuristics cannot discard a client's conversation.
+    const result = await ingestion.save({ tenantId, phone, displayPhone: display, name: msg.pushName,
+      message: text, messageId, adInfo, service: adInfo ? 'Anuncio Meta Ads WhatsApp' : 'Contacto Inicial WhatsApp' });
+    if (scopedId) markMessageIdProcessed(scopedId);
+    state.saved++;
+    state.lastSavedAt = new Date().toISOString();
+    state.lastError = null;
+    metric(tenantId, result.created ? 'created' : 'updated');
+    return result;
+  } catch (error) {
+    state.failed++;
+    state.lastError = error.message;
+    metric(tenantId, 'storage_error');
+    console.error('[Ingestion:' + tenantId + ']', error.message);
+    return { saved: false, reason: 'storage_error' };
   }
 }
+
+// Retry transient database failures and LID mappings that arrive after the message.
+let replaying = false;
+setInterval(async () => {
+  if (replaying) return;
+  replaying = true;
+  try {
+    for (const msg of [...recentMessagesBuffer].reverse()) {
+      const session = sessions.get(msg._tenantId);
+      if (!session?.sock || msg.key?.fromMe || !msg.message || isMessageIdProcessed(tenantKey(msg._tenantId, msg.key?.id))) continue;
+      await processIncomingMessage(session.sock, msg, 'retry', msg._tenantId);
+    }
+  } finally { replaying = false; }
+}, 60000).unref();
 
 // Sincronización inteligente con Cloud Firestore (Anti-desperdicio de cuotas)
 const HEARTBEAT_INTERVAL_MS = 4 * 60 * 1000; // 4 minutos en vez de 20 segundos
@@ -1330,7 +993,13 @@ async function startTenantWhatsAppBot(rawTenantId = 'kindev') {
     }
 
     const { state, saveCreds } = await useMultiFileAuthState(authDir);
-    const logger = pino({ level: 'silent' });
+    const logger = pino({ level: 'warn', hooks: { logMethod(args, method, level) {
+      const error = args.find(arg => typeof arg === 'object' && arg?.err)?.err;
+      const text = args.map(arg => typeof arg === 'string' ? arg : arg?.err?.message || '').join(' ');
+      if (/decrypt|Bad MAC|session|prekey/i.test(text)) metric(tenantId, 'decryption_error');
+      // Log only category and tenant; never serialize encryption keys or message contents.
+      if (level >= 50) console.warn('[WhatsApp:' + tenantId + '] Error de transporte/descifrado: ' + (error?.name || 'Error'));
+    } } });
 
     const sock = makeWASocket({
       auth: state,
@@ -1350,6 +1019,7 @@ async function startTenantWhatsAppBot(rawTenantId = 'kindev') {
     sock.ev.on('creds.update', saveCreds);
 
     sock.ev.on('connection.update', async (update) => {
+      if (session.sock !== sock) return;
       const { connection, lastDisconnect, qr } = update;
 
       if (qr) {
@@ -1382,7 +1052,8 @@ async function startTenantWhatsAppBot(rawTenantId = 'kindev') {
         updateFirestoreStatus(tenantId, 'reconnecting', '', 'Reconectando conexión');
 
         if (shouldReconnect) {
-          setTimeout(() => startTenantWhatsAppBot(tenantId), 3000);
+          clearTimeout(session.reconnectTimer);
+          session.reconnectTimer = setTimeout(() => startTenantWhatsAppBot(tenantId), 3000);
         } else {
           session.connectionStatus = 'initializing';
           session.connectedUser = '';
@@ -1391,10 +1062,7 @@ async function startTenantWhatsAppBot(rawTenantId = 'kindev') {
             connectedUser = '';
           }
           updateFirestoreStatus(tenantId, 'disconnected', '', 'Sesión cerrada');
-          try {
-            fs.rmSync(authDir, { recursive: true, force: true });
-          } catch (e) {}
-          setTimeout(() => startTenantWhatsAppBot(tenantId), 2000);
+          session.connectionStatus = 'disconnected';
         }
       } else if (connection === 'open') {
         console.log(`✅ [WhatsApp:${tenantId}] Conexión establecida con éxito!`);
@@ -1414,6 +1082,7 @@ async function startTenantWhatsAppBot(rawTenantId = 'kindev') {
     });
 
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
+      if (session.sock !== sock) return;
       if (!Array.isArray(messages)) return;
       for (const msg of messages) {
         try {
@@ -1425,6 +1094,7 @@ async function startTenantWhatsAppBot(rawTenantId = 'kindev') {
     });
 
     sock.ev.on('messaging-history.set', async ({ messages }) => {
+      if (session.sock !== sock) return;
       if (!Array.isArray(messages) || messages.length === 0) return;
       console.log(`📥 [WhatsApp:${tenantId} Sync] Recibido lote de historial con ${messages.length} mensajes.`);
       let syncSavedCount = 0;
@@ -1455,12 +1125,12 @@ setInterval(() => {
 
 // Auto-arranque de sesiones conocidas
 function autoStartKnownSessions() {
-  getOrCreateSession('kindev');
+  if (process.env.NODE_ENV !== 'test') getOrCreateSession('kindev');
   if (TENANT_ID && TENANT_ID !== 'kindev') {
     getOrCreateSession(TENANT_ID);
   }
   const tenantsDir = path.join(AUTH_DIR, 'tenants');
-  if (fs.existsSync(tenantsDir)) {
+  if (process.env.NODE_ENV !== 'test' && fs.existsSync(tenantsDir)) {
     try {
       const entries = fs.readdirSync(tenantsDir, { withFileTypes: true });
       for (const entry of entries) {
@@ -1488,6 +1158,8 @@ app.get(['/api/whatsapp/status', '/api/status'], (req, res) => {
     return res.json({
       tenantId,
       projectId: FIREBASE_PROJECT_ID,
+      version: RELEASE,
+      ingestion: metrics.get(tenantId) || { received: 0, saved: 0, failed: 0 },
       status: 'disconnected',
       isListening: false,
       connected: false,
@@ -1502,6 +1174,8 @@ app.get(['/api/whatsapp/status', '/api/status'], (req, res) => {
   res.json({
     tenantId,
     projectId: FIREBASE_PROJECT_ID,
+      version: RELEASE,
+      ingestion: metrics.get(tenantId) || { received: 0, saved: 0, failed: 0 },
     status: session.connectionStatus,
     isListening: session.connectionStatus === 'connected',
     connected: session.connectionStatus === 'connected',
@@ -1520,7 +1194,7 @@ app.post('/api/whatsapp/send', async (req, res) => {
   const { phone, message, filePath, fileName, caption, tenantId: rawTenantId } = req.body || {};
   const tenantId = sanitizeTenantId(rawTenantId || req.query.tenant || 'kindev');
   const session = getOrCreateSession(tenantId);
-  const activeSock = session.sock || globalSock;
+  const activeSock = session.sock;
 
   if (!activeSock || session.connectionStatus !== 'connected') {
     return res.status(503).json({ success: false, error: `WhatsApp no está conectado para la cuenta ${tenantId}.` });
@@ -1543,7 +1217,8 @@ app.post('/api/whatsapp/send', async (req, res) => {
     }
 
     let response;
-    if (filePath) {
+    if (filePath) return res.status(400).json({ error: 'No se permite enviar archivos del servidor.' });
+    if (false) {
       if (!fs.existsSync(filePath)) {
         return res.status(404).json({ success: false, error: `Archivo no encontrado en ruta: ${filePath}` });
       }
@@ -1578,10 +1253,11 @@ app.post('/api/whatsapp/send', async (req, res) => {
 
 // Endpoint para consultar historial reciente de una conversación específica
 app.get('/api/whatsapp/chat/:phone', async (req, res) => {
+  const tenantId = requireTenant(req.query.tenant || req.query.tenantId);
   const queryPhone = cleanPhone(req.params.phone) || req.params.phone;
   const results = [];
 
-  for (const msg of recentMessagesBuffer) {
+  for (const msg of recentMessagesBuffer.filter(m => m._tenantId === tenantId)) {
     try {
       const remoteJid = msg.key?.remoteJid || '';
       let isMatch = remoteJid.includes(queryPhone);
@@ -1633,7 +1309,7 @@ app.get('/api/whatsapp/chat/:phone', async (req, res) => {
 app.get('/api/whatsapp/sync-retroactive', async (req, res) => {
   const tenantId = sanitizeTenantId(req.query.tenant || req.query.tenantId || 'kindev');
   const session = getOrCreateSession(tenantId);
-  const activeSock = session.sock || globalSock;
+  const activeSock = session.sock;
 
   if (!activeSock || session.connectionStatus !== 'connected') {
     return res.status(503).json({
@@ -1648,7 +1324,7 @@ app.get('/api/whatsapp/sync-retroactive', async (req, res) => {
   try {
     if (recentMessagesBuffer.length > 0) {
       scannedCount = recentMessagesBuffer.length;
-      for (const msg of recentMessagesBuffer) {
+      for (const msg of recentMessagesBuffer.filter(m => m._tenantId === tenantId)) {
         try {
           const result = await processIncomingMessage(activeSock, msg, 'manual_sync', tenantId);
           if (result?.saved) recoveredLeads++;
@@ -1739,7 +1415,7 @@ app.get('/api/whatsapp/outbound-tracker-full', (req, res) => {
 app.get('/api/blacklist', (req, res) => {
   loadBlacklist();
   const tenantId = sanitizeTenantId(req.query.tenant || req.query.tenantId || 'kindev');
-  const filtered = blacklistData.filter(b => !b.tenantId || b.tenantId === tenantId || tenantId === 'kindev');
+  const filtered = blacklistData.filter(b => (b.tenantId || 'kindev') === tenantId);
   res.json({ success: true, count: filtered.length, blacklist: filtered });
 });
 
@@ -2406,7 +2082,7 @@ app.get('*', (req, res) => {
   const f = path.join(__dirname, 'dist', 'index.html'); if (fs.existsSync(f)) { return res.sendFile(f); } res.send('<h3>WhatsApp Listener Bot Activo</h3><p><a href="/qr">Escanear QR</a></p>');
 });
 
-app.listen(PORT, () => {
+if (process.env.NODE_ENV !== 'test') app.listen(PORT, () => {
   const publicUrl = process.env.RENDER_EXTERNAL_URL || 'https://whatsapp-listeneer.onrender.com';
   console.log(`🚀 [Kindev CAPI & WhatsApp Server] Activo en puerto ${PORT} (Render Nube)`);
   console.log(`👉 Enlace Seguro del QR: ${publicUrl}/qr`);
@@ -2426,3 +2102,5 @@ process.on('unhandledRejection', (reason) => {
   if (msg.includes('Bad MAC') || msg.includes('Session error') || msg.includes('Failed to decrypt')) return;
   console.error('⚠️ [Kindev Daemon - Promesa rechazada]:', reason);
 });
+
+export { app, processIncomingMessage };

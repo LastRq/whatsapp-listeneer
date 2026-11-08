@@ -1,3 +1,4 @@
+import { requireTenant } from './tenant-ingestion.js';
 import crypto from 'node:crypto';
 import { firestoreFetch, TENANT_ID } from './firebase-client.js';
 import { DOCUMENTS_URL, decode, readDocument, appendMetaEvent, patchDocument, loadTenantConfig, sendMetaEvent, phoneNumber } from './meta-integration.js';
@@ -34,7 +35,7 @@ export async function deliverWhatsAppLead(lead) {
 export async function saveWhatsAppLead(payload) {
   const phone = phoneNumber(payload.phone);
   if (phone.length < 8 || phone.length > 15) throw new Error('Número de WhatsApp no válido.');
-  const effectiveTenant = payload.tenantId || (TENANT_ID === 'kindev' ? 'gabriel_miranda_gi1yk' : TENANT_ID);
+  const effectiveTenant = requireTenant(payload.tenantId);
   const effectiveService = payload.service || (effectiveTenant === 'gabriel_miranda_gi1yk' ? 'Promoción Campaña ($50 USD)' : 'Contacto Meta Ads');
 
   const existing = await findPhoneLead(phone, effectiveTenant);

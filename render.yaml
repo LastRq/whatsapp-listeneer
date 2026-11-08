@@ -19,7 +19,7 @@ services:
       - key: KINDEVADS_FIREBASE_API_KEY
         value: AIzaSyDuY8r3OQ08dG-JEk_XSs08M2U8e56W5J8
       - key: ONLY_META_ADS
-        value: "true"
+        value: "false"
       - key: DEBUG
         value: "false"
       - key: SESSIONS_DIR
