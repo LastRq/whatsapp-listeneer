@@ -183,18 +183,25 @@ installAccountRoutes(app);
 app.use('/api', async (req, res, next) => {
   res.setHeader('Cache-Control', 'no-store');
   if (['/status', '/whatsapp/status'].includes(req.path)) return next();
+  const selectors = [req.query.tenant, req.query.tenantId, req.query.client, req.body?.tenantId, req.body?.client].filter(value => value !== undefined && value !== '');
+  if (selectors.some(value => value !== selectors[0])) return res.status(400).json({ error: 'Cuenta incoherente.' });
+  const tenant = selectors[0];
+  const canonicalize = () => {
+    if (!tenant) return;
+    requireTenant(tenant);
+    req.accountTenant = tenant;
+    req.query.tenant = tenant; req.query.tenantId = tenant; req.query.client = tenant;
+    req.body = { ...(req.body || {}), tenantId: tenant, client: tenant };
+  };
   const expected = process.env.ADMIN_KEY || process.env['ADMIN-KEY'];
   const supplied = String(req.headers['x-admin-key'] || '');
-  if (expected && Buffer.byteLength(supplied) === Buffer.byteLength(expected) && crypto.timingSafeEqual(Buffer.from(supplied), Buffer.from(expected))) return next();
   try {
-    const tenant = req.query.tenant || req.query.tenantId || req.body?.tenantId;
-    if (req.path === '/whatsapp/relink' && verifyLinkTicket(req.query.ticket, tenant)) return next();
+    if (expected && Buffer.byteLength(supplied) === Buffer.byteLength(expected) && crypto.timingSafeEqual(Buffer.from(supplied), Buffer.from(expected))) { canonicalize(); return next(); }
+    if (req.path === '/whatsapp/relink' && verifyLinkTicket(req.query.ticket, tenant)) { canonicalize(); return next(); }
     const member = await verifyAccountRequest(req);
     authorizeTenant(member, tenant);
-    // A caller cannot mix two tenant selectors on the same operation.
-    for (const requested of [req.query.tenant, req.query.tenantId, req.body?.tenantId]) if (requested && requested !== tenant) throw new Error('Cuenta incoherente.');
     if (!req.path.startsWith('/whatsapp/') && !req.path.startsWith('/blacklist')) throw new Error('Operación administrativa.');
-    req.accountTenant = tenant;
+    canonicalize();
     next();
   } catch (error) { res.status(401).json({ error: error.message }); }
 });
@@ -221,12 +228,12 @@ async function resolveRealPhone(sock, msg, authDir) {
 
   // 1. Si remoteJidAlt o participantAlt contiene el número real (@s.whatsapp.net)
   const alt = msg.key?.remoteJidAlt || msg.key?.participantAlt;
-  if (alt && (alt.endsWith('@s.whatsapp.net') || alt.includes('@s.whatsapp.net'))) {
+  if (alt && (alt.endsWith('@s.whatsapp.net') || alt.endsWith('@hosted'))) {
     resolved = alt.split('@')[0].split(':')[0];
   }
 
   // 2. Si es un LID, consultar Baileys signalRepository.lidMapping
-  if (!resolved && remoteJid.endsWith('@lid') && sock?.signalRepository?.lidMapping) {
+  if (!resolved && (remoteJid.endsWith('@lid') || remoteJid.endsWith('@hosted.lid')) && sock?.signalRepository?.lidMapping) {
     try {
       const pn = await sock.signalRepository.lidMapping.getPNForLID(remoteJid);
       if (pn) {
@@ -238,7 +245,7 @@ async function resolveRealPhone(sock, msg, authDir) {
   }
 
   // 3. Si aún no está resuelto y es un LID, consultar archivo de mapeo inverso en auth_baileys
-  if (!resolved && remoteJid.endsWith('@lid')) {
+  if (!resolved && (remoteJid.endsWith('@lid') || remoteJid.endsWith('@hosted.lid'))) {
     const lidUser = remoteJid.split('@')[0].split(':')[0];
     const reverseFile = path.join(authDir, `lid-mapping-${lidUser}_reverse.json`);
     
@@ -260,7 +267,7 @@ async function resolveRealPhone(sock, msg, authDir) {
   }
 
   // 4. Si no es LID (mensaje normal de WhatsApp directo)
-  if (!resolved && !remoteJid.endsWith('@lid')) {
+  if (!resolved && !(remoteJid.endsWith('@lid') || remoteJid.endsWith('@hosted.lid'))) {
     resolved = remoteJid.split('@')[0].split(':')[0];
   }
 
@@ -375,7 +382,7 @@ function isPhoneOutboundTracked(phone, remoteJid = '') {
     if (cleanJid && outboundPhonesMap.has(cleanJid)) return true;
 
     // Si es LID, verificar mapeo inverso en auth_baileys
-    if (remoteJid.endsWith('@lid')) {
+    if ((remoteJid.endsWith('@lid') || remoteJid.endsWith('@hosted.lid'))) {
       const reverseFile = path.join(AUTH_DIR, `lid-mapping-${rawUser}_reverse.json`);
       if (fs.existsSync(reverseFile)) {
         try {
@@ -859,7 +866,7 @@ async function processIncomingMessage(sock, msg, contextSource = 'live', session
     return reject('from_me');
   }
   const remoteJid = msg.key?.remoteJid || '';
-  if (!/@(s\.whatsapp\.net|lid)$/.test(remoteJid)) return reject('group_or_status');
+  if (!/@(s\.whatsapp\.net|lid|hosted|hosted\.lid)$/.test(remoteJid)) return reject('group_or_status');
   const timestamp = msg.messageTimestamp ? Number(msg.messageTimestamp) * 1000 : Date.now();
   if (Date.now() - timestamp > 72 * 3600000) return reject('too_old');
   const messageId = msg.key?.id;
@@ -1344,16 +1351,9 @@ app.get('/api/whatsapp/chat/:phone', async (req, res) => {
   for (const msg of recentMessagesBuffer.filter(m => m._tenantId === tenantId)) {
     try {
       const remoteJid = msg.key?.remoteJid || '';
-      let isMatch = remoteJid.includes(queryPhone);
-      
-      if (!isMatch && remoteJid.endsWith('@lid')) {
-        const lidUser = remoteJid.split('@')[0].split(':')[0];
-        const reverseFile = path.join(AUTH_DIR, `lid-mapping-${lidUser}_reverse.json`);
-        if (fs.existsSync(reverseFile)) {
-          const mapped = cleanPhone(JSON.parse(fs.readFileSync(reverseFile, 'utf8')));
-          if (mapped === queryPhone) isMatch = true;
-        }
-      }
+      const session = sessions.get(tenantId);
+      const resolved = await resolveRealPhone(session?.sock, msg, session?.authDir || getTenantAuthDir(tenantId));
+      const isMatch = resolved.phone === queryPhone || (queryPhone.startsWith('@') && remoteJid.endsWith(queryPhone));
 
       if (isMatch) {
         const text =

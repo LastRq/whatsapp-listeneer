@@ -64,6 +64,7 @@ test('gateway enforces account credential, ignores body credentials, rejects for
  const app = express(); app.use(express.json());
  const received = [];
  installMetaRoutes(app, {
+  verifyMember: async req => req.get('Authorization') === 'Bearer foreign-client' ? {tenantId:'another-client',role:'client'} : {tenantId:'miranda',role:'client'},
   loadConfig: async id => { if(id!=='miranda') throw Error('Cuenta no encontrada.'); return cfg; },
   sendEvent: async (p,c) => { received.push(c); return {tenantId:c.tenantId,datasetId:c.datasetId,eventsReceived:1}; }
  });
@@ -75,6 +76,7 @@ test('gateway enforces account credential, ignores body credentials, rejects for
   assert.equal((await fetch(base,{method:'POST',headers:{'X-Meta-Token':'kindev-secret'}})).status,401);
   assert.equal((await fetch(base,{method:'POST',headers:{'X-Meta-Token':cfg.accessToken,Origin:'https://foreign.example'}})).status,403);
   const headers = {'X-Meta-Token':cfg.accessToken,'Content-Type':'application/json'};
+  assert.equal((await fetch(base,{method:'POST',headers:{...headers,Authorization:'Bearer foreign-client'},body:JSON.stringify({params})})).status,403);
   assert.equal((await fetch(base,{method:'POST',headers,body:JSON.stringify({datasetId:'111',params})})).status,422);
   const accepted = await fetch(base,{method:'POST',headers,body:JSON.stringify({datasetId:'222',accessToken:'injected',params})});
   assert.equal(accepted.status,200); assert.equal(received.length,1); assert.equal(received[0].accessToken,cfg.accessToken);

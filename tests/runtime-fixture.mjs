@@ -14,6 +14,8 @@ globalThis.fetch = async (input, options = {}) => {
   const url = new URL(input);
   if (url.hostname === '127.0.0.1') return network(input, options);
   if (url.hostname !== 'database.test') return new Response('{}', { status: 503 });
+  if (url.pathname === '/auth/v1/user') return Response.json({id:'client-user'});
+  if (url.pathname === '/rest/v1/tenant_memberships') return Response.json([{tenant_id:'client_a',role:'client'}]);
   const tenant = url.searchParams.get('tenant_id')?.slice(3);
   const body = options.body && JSON.parse(options.body);
   if (options.method === 'POST') { rows.push(body); return Response.json([body]); }
@@ -44,9 +46,20 @@ try {
   const status = await (await network(base + '/api/status?tenant=kindev')).json();
   assert.equal(status.version, 'tenant-ingestion-20261108-placeholder-recovery');
   assert.equal(status.ingestion.saved, 3);
+  const hosted = await processIncomingMessage(socket, { ...makeMessage('HOSTED'), key: { id: 'HOSTED', remoteJid: '593987654321@hosted' } }, 'live', 'hosted_client');
+  assert.equal(hosted.saved, true);
+  const hostedLid = await processIncomingMessage(socket, { ...makeMessage('HOSTED_LID'), key: { id: 'HOSTED_LID', remoteJid: '1234567@hosted.lid', remoteJidAlt: '593987654321@hosted' } }, 'live', 'hosted_lid_client');
+  assert.equal(hostedLid.saved, true);
   for (const route of ['/api/whatsapp/chat/593987654321?tenant=kindev', '/api/whatsapp/disconnect?tenant=kindev', '/api/whatsapp/outbound-tracker-full']) {
     assert.equal((await network(base + route)).status, 401);
   }
+  const mixed = await network(base + '/api/whatsapp/relink?tenant=client_a&ticket=invalid', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({tenantId:'kindev'}) });
+  assert.equal(mixed.status,400);
+  const blacklist = await network(base + '/api/blacklist/add?tenantId=client_a', { method: 'POST', headers: { Authorization:'Bearer verified-client', 'Content-Type':'application/json' }, body: JSON.stringify({phone:'593987654321'}) });
+  assert.equal(blacklist.status,200);
+  assert.equal((await blacklist.json()).entry.tenantId,'client_a');
+  const conflict = await network(base + '/api/blacklist/add?tenant=client_a', { method:'POST', headers:{Authorization:'Bearer verified-client','Content-Type':'application/json'}, body:JSON.stringify({tenantId:'kindev',phone:'593987654321'}) });
+  assert.equal(conflict.status,400);
   const own = await (await network(base + '/api/whatsapp/chat/593987654321?tenant=kindev', { headers: { 'x-admin-key': 'test-admin' } })).json();
   assert.ok(own.messages.length > 0);
   console.log('RUNTIME_OK: socket ingestion, tenant isolation, LID resolution, truthful status and protected APIs');

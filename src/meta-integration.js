@@ -1,4 +1,4 @@
-import { loadDatabaseTenantConfig } from './account-auth.js';
+import { loadDatabaseTenantConfig, verifyAccountRequest, authorizeTenant } from './account-auth.js';
 import crypto from 'node:crypto';
 import { firestoreFetch, FIREBASE_PROJECT_ID } from './firebase-client.js';
 
@@ -191,19 +191,21 @@ export async function fetchTenantInsights(config) {
     killSwitch: { enabled: false, maxCostPerMessage: 0, maxSpendWithoutLead: 0, currentCost: 0, statusText: 'Sin automatización de anuncios' }
   };
 }
-export function installMetaRoutes(app, { loadConfig = loadTenantConfig, sendEvent = sendMetaEvent, checkConfig = checkMetaConfig, fetchInsights = fetchTenantInsights } = {}) {
+export function installMetaRoutes(app, { loadConfig = loadTenantConfig, sendEvent = sendMetaEvent, checkConfig = checkMetaConfig, fetchInsights = fetchTenantInsights, verifyMember = verifyAccountRequest } = {}) {
   app.use('/api/meta', (req, res, next) => {
     const origin = req.get('Origin');
     if (origin && !OFFICIAL_ORIGINS.has(origin)) return res.status(403).json({ error: 'Origen no permitido.' });
     if (origin) res.set('Access-Control-Allow-Origin', origin).vary('Origin');
     res.set('Cache-Control', 'no-store');
-    res.set('Access-Control-Allow-Headers', 'Content-Type,X-Meta-Token');
+    res.set('Access-Control-Allow-Headers', 'Content-Type,X-Meta-Token,Authorization');
     res.set('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
     if (req.method === 'OPTIONS') return res.sendStatus(204);
     next();
   });
   app.use('/api/meta/:tenantId', async (req, res, next) => {
     try {
+      const member = await verifyMember(req);
+      try { authorizeTenant(member, req.params.tenantId); } catch (error) { return res.status(403).json({ error: error.message }); }
       const config = await loadConfig(req.params.tenantId);
       if (!authorizeMeta(config, req.get('X-Meta-Token'))) return res.status(401).json({ error: 'No hay credenciales válidas para esta cuenta.' });
       req.metaConfig = config; next();
