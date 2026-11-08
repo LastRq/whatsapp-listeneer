@@ -997,9 +997,9 @@ async function startTenantWhatsAppBot(rawTenantId = 'kindev') {
     }
     const { state, saveCreds } = await useMultiFileAuthState(authDir);
     const logger = pino({ level: 'warn', hooks: { logMethod(args, method, level) {
-      const error = args.find(arg => typeof arg === 'object' && arg?.err)?.err;
+      const error = args.find(arg => typeof arg === 'object' && (arg?.err || arg?.error))?.err || args.find(arg => typeof arg === 'object' && arg?.error)?.error;
       const text = args.map(arg => typeof arg === 'string' ? arg : arg?.err?.message || '').join(' ');
-      if (/decrypt|Bad MAC|session|prekey/i.test(text)) metric(tenantId, 'decryption_error');
+      if (/decrypt|Bad MAC|session|prekey/i.test(text)) { const state = metric(tenantId, 'decryption_error'); state.lastTransportError = String(error?.message || text).replace(/\d{7,}/g, '[redacted]').slice(0, 160); }
       // Log only category and tenant; never serialize encryption keys or message contents.
       if (level >= 50) console.warn('[WhatsApp:' + tenantId + '] Error de transporte/descifrado: ' + (error?.name || 'Error'));
     } } });
@@ -1020,6 +1020,7 @@ async function startTenantWhatsAppBot(rawTenantId = 'kindev') {
       globalSock = sock;
     }
 
+    sock.ws.on('CB:message', () => { metric(tenantId, 'wire_message'); });
     sock.ev.on('creds.update', () => { if (session.sock === sock) return saveCreds(); });
 
     sock.ev.on('connection.update', async (update) => {
@@ -1191,6 +1192,30 @@ app.get(['/api/whatsapp/status', '/api/status'], (req, res) => {
     processedMessagesCount: processedMessageIds.size,
     updatedAt: new Date().toISOString()
   });
+});
+
+// Redacted diagnostics: correlate wire packets with application events without exposing keys or chat text.
+app.get('/api/whatsapp/diagnostics', async (req, res) => {
+  try {
+    const tenantId = requireTenant(req.query.tenant);
+    const session = sessions.get(tenantId);
+    const sock = session?.sock;
+    const rows = [];
+    for (const msg of recentMessagesBuffer.filter(item => item._tenantId === tenantId).slice(0, 30)) {
+      const remote = msg.key?.remoteJid || '';
+      const resolved = sock ? await resolveRealPhone(sock, msg, session.authDir) : {};
+      rows.push({ idHash: crypto.createHash('sha256').update(msg.key?.id || '').digest('hex').slice(0, 12),
+        timestamp: Number(msg.messageTimestamp || 0) * 1000, fromMe: Boolean(msg.key?.fromMe),
+        remoteKind: remote.split('@')[1], phoneSuffix: resolved.phone?.slice(-4) || '',
+        messageTypes: Object.keys(msg.message || {}), stubType: msg.messageStubType,
+        stubReasons: (msg.messageStubParameters || []).map(value => String(value).replace(/\d{7,}/g, '[redacted]').slice(0, 120)) });
+    }
+    let creds = {};
+    try { creds = JSON.parse(fs.readFileSync(path.join(session.authDir, 'creds.json'), 'utf8')); } catch {}
+    res.json({ tenantId, version: RELEASE, status: session?.connectionStatus,
+      phoneSuffix: session?.connectedUser?.slice(-4), hasLid: Boolean(creds.me?.lid),
+      isBuffering: sock?.ev?.isBuffering?.(), metrics: metrics.get(tenantId), messages: rows });
+  } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
 // Endpoint para enviar mensajes o documentos directos por WhatsApp (Baileys)
