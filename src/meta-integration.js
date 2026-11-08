@@ -1,3 +1,4 @@
+import { loadDatabaseTenantConfig } from './account-auth.js';
 import crypto from 'node:crypto';
 import { firestoreFetch, FIREBASE_PROJECT_ID } from './firebase-client.js';
 
@@ -57,9 +58,7 @@ export function selectTenantConfig(tenantId, master, clients = []) {
   return { ...client.metaConfig, tenantId, datasetId: client.metaConfig?.datasetId || '', accessToken: client.metaConfig?.accessToken || '' };
 }
 export async function loadTenantConfig(tenantId) {
-  if (tenantId === 'kindev') return selectTenantConfig(tenantId, await readDocument('settings/meta_config'));
-  const registry = await readDocument('settings/tenants_registry');
-  return selectTenantConfig(tenantId, null, registry?.clients || []);
+  return loadDatabaseTenantConfig(tenantId);
 }
 export function authorizeMeta(config, supplied) {
   const a = Buffer.from(String(config.accessToken || ''));

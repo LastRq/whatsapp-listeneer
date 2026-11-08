@@ -28,6 +28,8 @@ export function createTenantIngestion({ request, inbox, mirror = async () => {},
       let lead;
       if (existing) {
         const patch = { notes, last_contact_date: timestamp,
+          ...(existing.outbound_tracking?.firstSentAt ? { outbound_tracking: { ...existing.outbound_tracking,
+            replyCount: (existing.outbound_tracking.replyCount || 0) + 1, lastReplyAt: Date.parse(timestamp) } } : {}),
           ...(payload.adInfo?.ctwaClid && !existing.ctwa_clid ? { ctwa_clid: payload.adInfo.ctwaClid } : {}) };
         const updated = await request('leads?id=eq.' + encodeURIComponent(existing.id) + '&tenant_id=eq.' + encodeURIComponent(tenant), { method: 'PATCH', body: patch });
         if (!updated.length) throw new Error('No se confirmó la actualización del contacto.');
@@ -40,14 +42,14 @@ export function createTenantIngestion({ request, inbox, mirror = async () => {},
           notes, status: 'prospecto', amount: 0, created_at: timestamp, last_contact_date: timestamp,
           source: 'whatsapp_auto', event_id: eventId, meta_events: [],
           ...(payload.adInfo?.ctwaClid ? { ctwa_clid: payload.adInfo.ctwaClid } : {}),
-          meta_delivery: { status: 'pending', eventId } };
+          meta_delivery: payload.suppressMeta ? { status: 'skipped', reason: 'operator_test', eventId } : { status: 'pending', eventId } };
         const inserted = await request('leads', { method: 'POST', body: lead });
         if (!inserted.length) throw new Error('No se confirmó la creación del contacto.');
         lead = inserted[0];
       }
       // CRM capture succeeds independently of Firebase quota or Meta availability.
       Promise.resolve().then(() => mirror(lead)).catch(e => console.warn('[Mirror]', e.message));
-      if (!existing) Promise.resolve().then(() => deliver(lead)).catch(e => console.warn('[CAPI]', e.message));
+      if (!existing && !payload.suppressMeta) Promise.resolve().then(() => deliver(lead)).catch(e => console.warn('[CAPI]', e.message));
       return { saved: true, created: !existing, id: lead.id };
     });
     locks.set(key, operation);
@@ -58,7 +60,26 @@ export function createTenantIngestion({ request, inbox, mirror = async () => {},
     }
     finally { if (locks.get(key) === operation) locks.delete(key); }
   }
-  return { save, async drain() {
+  return { save, async recordOutbound(payload) {
+    const tenant = requireTenant(payload.tenantId);
+    const phone = String(payload.phone || '').replace(/\D/g, '');
+    if (!/^\d{8,15}$/.test(phone)) return;
+    const key = tenantKey(tenant, phone);
+    const previous = locks.get(key) || Promise.resolve();
+    const operation = previous.catch(() => {}).then(async () => {
+      const rows = await request('leads?tenant_id=eq.' + encodeURIComponent(tenant) + '&phone=in.(' + phone + ',%2B' + phone + ')&select=*&order=created_at.asc&limit=1');
+      const lead = rows[0];
+      if (!lead) return;
+      const tracker = lead.outbound_tracking || {};
+      if (tracker.lastSentAt >= payload.timestamp) return;
+      await request('leads?id=eq.' + encodeURIComponent(lead.id) + '&tenant_id=eq.' + encodeURIComponent(tenant), {
+        method: 'PATCH', body: { outbound_tracking: { ...tracker, firstSentAt: tracker.firstSentAt || payload.timestamp,
+          lastSentAt: payload.timestamp, replyCount: tracker.replyCount || 0, snippet: '' } }
+      });
+    });
+    locks.set(key, operation);
+    try { await operation; } finally { if (locks.get(key) === operation) locks.delete(key); }
+  }, async drain() {
     for (const payload of inbox?.pending() || []) {
       try { await save(payload); } catch (e) { console.warn('[Inbox:' + payload.tenantId + ']', e.message); }
     }
@@ -70,7 +91,7 @@ export function createSupabaseRequest(base, key, fetcher = fetch) {
   return async (resource, options = {}) => {
     const response = await fetcher(base + '/rest/v1/' + resource, {
       method: options.method || 'GET', headers: { apikey: key, Authorization: 'Bearer ' + key,
-        'Content-Type': 'application/json', Prefer: 'return=representation' },
+        'Content-Type': 'application/json', Prefer: (options.upsert ? 'resolution=merge-duplicates,' : '') + 'return=representation' },
       ...(options.body ? { body: JSON.stringify(options.body) } : {}), signal: AbortSignal.timeout(15000)
     });
     if (!response.ok) throw new Error('Supabase no confirmó el guardado/lectura (' + response.status + ').');

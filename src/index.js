@@ -7,10 +7,11 @@ import { fileURLToPath } from 'node:url';
 import makeWASocket, { useMultiFileAuthState, DisconnectReason } from '@whiskeysockets/baileys';
 import QRCode from 'qrcode';
 import pino from 'pino';
+import { installAccountRoutes, verifyAccountRequest, authorizeTenant, verifyLinkTicket } from './account-auth.js';
 import { createDurableInbox } from './durable-inbox.js';
 import { createTenantIngestion, createSupabaseRequest, requireTenant, tenantKey } from './tenant-ingestion.js';
 import { loadTenantConfig, sendMetaEvent, installMetaRoutes } from './meta-integration.js';
-const RELEASE = 'tenant-ingestion-20261108';
+const RELEASE = 'tenant-ingestion-20261108-auth';
 const metrics = new Map();
 function metric(tenant, reason) {
   const state = metrics.get(tenant) || { received: 0, saved: 0, failed: 0, lastReceivedAt: null, lastSavedAt: null, reasons: {} };
@@ -172,18 +173,29 @@ async function dispatchCapiBusinessMessagingLead({ phone, name, remoteJid, text 
   }
 }
 
-app.use(cors());
+app.set('trust proxy', 1);
+app.use(cors({ origin: ['https://kindevads.com', 'https://www.kindevads.com', 'https://kindevads.web.app'] }));
 app.use(express.json({ limit: '256kb' }));
+app.use(express.urlencoded({ extended: false }));
 installMetaRoutes(app);
-app.use('/api', (req, res, next) => {
+installAccountRoutes(app);
+app.use('/api', async (req, res, next) => {
   res.setHeader('Cache-Control', 'no-store');
   if (['/status', '/whatsapp/status'].includes(req.path)) return next();
   const expected = process.env.ADMIN_KEY || process.env['ADMIN-KEY'];
   const supplied = String(req.headers['x-admin-key'] || '');
-  if (!expected || Buffer.byteLength(supplied) !== Buffer.byteLength(expected) || !crypto.timingSafeEqual(Buffer.from(supplied), Buffer.from(expected))) {
-    return res.status(401).json({ error: 'Se requiere autorización del administrador.' });
-  }
-  next();
+  if (expected && Buffer.byteLength(supplied) === Buffer.byteLength(expected) && crypto.timingSafeEqual(Buffer.from(supplied), Buffer.from(expected))) return next();
+  try {
+    const tenant = req.query.tenant || req.query.tenantId || req.body?.tenantId;
+    if (req.path === '/whatsapp/relink' && verifyLinkTicket(req.query.ticket, tenant)) return next();
+    const member = await verifyAccountRequest(req);
+    authorizeTenant(member, tenant);
+    // A caller cannot mix two tenant selectors on the same operation.
+    for (const requested of [req.query.tenant, req.query.tenantId, req.body?.tenantId]) if (requested && requested !== tenant) throw new Error('Cuenta incoherente.');
+    if (!req.path.startsWith('/whatsapp/') && !req.path.startsWith('/blacklist')) throw new Error('Operación administrativa.');
+    req.accountTenant = tenant;
+    next();
+  } catch (error) { res.status(401).json({ error: error.message }); }
 });
 app.use(express.static(path.join(__dirname, 'dist')));
 
@@ -513,7 +525,7 @@ function isPhoneBlacklisted(phone, tenantId) {
   const safeTenant = sanitizeTenantId(tenantId || 'kindev');
   return blacklistData.some(b => {
     const bClean = cleanPhone(b.cleanPhone || b.phone || '');
-    const matchPhone = bClean === clean || (clean && bClean && (clean.endsWith(bClean) || bClean.endsWith(clean)));
+    const matchPhone = bClean === clean;
     const matchTenant = (b.tenantId || 'kindev') === safeTenant;
     return matchPhone && matchTenant;
   });
@@ -550,7 +562,7 @@ function addToBlacklist({ phone, name, tenantId, reason }) {
       'Content-Type': 'application/json',
       'Prefer': 'resolution=merge-duplicates'
     },
-    body: JSON.stringify(entry)
+    body: JSON.stringify({ id: entry.id, tenant_id: entry.tenantId, phone: entry.phone, clean_phone: entry.cleanPhone, name: entry.name, reason: entry.reason, created_at: entry.createdAt })
   }).catch(() => {});
 
   return entry;
@@ -575,6 +587,17 @@ function removeFromBlacklist(phone, tenantId) {
 }
 
 // Mapeo en memoria de clientes existentes en Firestore para PREVENIR DUPLICADOS
+async function refreshDatabaseBlacklist() {
+  try {
+    const response = await fetch(SUPABASE_URL + '/rest/v1/blacklist?select=*', { headers: { apikey: SUPABASE_KEY, Authorization: 'Bearer ' + SUPABASE_KEY }, signal: AbortSignal.timeout(10000) });
+    if (!response.ok) return;
+    const rows = await response.json();
+    blacklistData = rows.map(row => ({ id: row.id, tenantId: row.tenant_id, phone: row.phone, cleanPhone: row.clean_phone, name: row.name, reason: row.reason, createdAt: row.created_at }));
+    saveBlacklist();
+  } catch {}
+}
+if (process.env.NODE_ENV !== 'test') { void refreshDatabaseBlacklist(); setInterval(refreshDatabaseBlacklist, 60000).unref(); }
+
 const existingFirestoreLeadsByPhone = new Map(); // phone -> { id, name, status, amount, notes }
 
 const LEADS_DISK_CACHE_FILE = path.join(AUTH_DIR, 'firestore_leads_cache.json');
@@ -809,7 +832,16 @@ async function processIncomingMessage(sock, msg, contextSource = 'live', session
   state.lastReceivedAt = new Date().toISOString();
   addToRecentMessagesBuffer(msg, tenantId);
   const reject = reason => { metric(tenantId, reason); return { saved: false, reason }; };
-  if (msg.key?.fromMe) return reject('from_me');
+  if (msg.key?.fromMe) {
+    const timestamp = msg.messageTimestamp ? Number(msg.messageTimestamp) * 1000 : Date.now();
+    if (Date.now() - timestamp < 72 * 3600000) {
+      try {
+        const { phone } = await resolveRealPhone(sock, msg, sessions.get(tenantId)?.authDir || getTenantAuthDir(tenantId));
+        await ingestion.recordOutbound({ tenantId, phone, timestamp });
+      } catch (error) { metric(tenantId, 'outbound_storage_error'); }
+    }
+    return reject('from_me');
+  }
   const remoteJid = msg.key?.remoteJid || '';
   if (!/@(s\.whatsapp\.net|lid)$/.test(remoteJid)) return reject('group_or_status');
   const timestamp = msg.messageTimestamp ? Number(msg.messageTimestamp) * 1000 : Date.now();
@@ -837,7 +869,7 @@ async function processIncomingMessage(sock, msg, contextSource = 'live', session
     if (phone === ownPhone || isPhoneBlacklisted(phone, tenantId)) return reject('blacklisted_or_self');
     // Every genuine inbound chat is captured. Ads/outbound heuristics cannot discard a client's conversation.
     const result = await ingestion.save({ tenantId, phone, displayPhone: display, name: msg.pushName,
-      message: text, messageId, adInfo, service: adInfo ? 'Anuncio Meta Ads WhatsApp' : 'Contacto Inicial WhatsApp' });
+      message: text, messageId, adInfo, suppressMeta: /^prueba kindev 0811$/i.test(text.trim()), service: adInfo ? 'Anuncio Meta Ads WhatsApp' : 'Contacto Inicial WhatsApp' });
     if (scopedId) markMessageIdProcessed(scopedId);
     state.saved++;
     state.lastSavedAt = new Date().toISOString();
@@ -897,62 +929,21 @@ function getTenantAuthDir(tenantId) {
 }
 
 async function updateFirestoreStatus(tenantId, status, user = '', note = '', force = false) {
-  const safeId = sanitizeTenantId(tenantId);
-  const session = sessions.get(safeId);
-  const now = Date.now();
-  const statusKey = `${status}|${user}|${note}`;
-
-  if (!force && session && statusKey === session.lastStatusWritten && (now - session.lastStatusWriteTime < HEARTBEAT_INTERVAL_MS)) {
-    return;
-  }
-
-  // 1. Enviar estado a Supabase (Base de datos principal)
-  try {
-    const sbPayload = {
-      tenant_id: safeId,
-      status: status,
-      user_phone: user || '',
-      note: note || '',
-      is_listening: status === 'connected',
-      updated_at: new Date().toISOString()
-    };
-    fetch(`${SUPABASE_URL}/rest/v1/whatsapp_status`, {
-      method: 'POST',
-      headers: {
-        'apikey': SUPABASE_KEY,
-        'Authorization': `Bearer ${SUPABASE_KEY}`,
-        'Content-Type': 'application/json',
-        'Prefer': 'resolution=merge-duplicates'
-      },
-      body: JSON.stringify(sbPayload)
-    }).catch(() => {});
-  } catch {}
-
-  // 2. Enviar estado a Firestore en segundo plano (mantener compatibilidad)
-  try {
-    const payload = {
-      fields: {
-        tenantId: { stringValue: safeId },
-        status: { stringValue: status },
-        user: { stringValue: user || '' },
-        note: { stringValue: note || '' },
-        isListening: { booleanValue: status === 'connected' },
-        updatedAt: { stringValue: new Date().toISOString() }
-      }
-    };
-    const targetUrl = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/settings/whatsapp_status_cloud_${safeId}`;
-    await fetch(targetUrl, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
-    });
-    if (session) {
-      session.lastStatusWritten = statusKey;
-      session.lastStatusWriteTime = now;
-    }
-  } catch (err) {
-    // Silencioso
-  }
+  const id = requireTenant(tenantId);
+  const session = sessions.get(id);
+  const statusKey = status + '|' + user + '|' + note;
+  if (!force && session?.lastStatusWritten === statusKey && Date.now() - session.lastStatusWriteTime < HEARTBEAT_INTERVAL_MS) return;
+  const write = async () => {
+    try {
+      await databaseRequest('whatsapp_status?on_conflict=tenant_id', { method: 'POST', upsert: true, body: {
+        tenant_id: id, status, user_phone: user, note, is_listening: status === 'connected', updated_at: new Date().toISOString()
+      } });
+      if (session) { session.lastStatusWritten = statusKey; session.lastStatusWriteTime = Date.now(); }
+    } catch (error) { console.warn('[Status:' + id + ']', error.message); }
+  };
+  if (!session) return write();
+  session.statusQueue = (session.statusQueue || Promise.resolve()).catch(() => {}).then(write);
+  return session.statusQueue;
 }
 
 // Variables para compatibilidad hacia atrás
@@ -1182,7 +1173,7 @@ app.get(['/api/whatsapp/status', '/api/status'], (req, res) => {
     connected: session.connectionStatus === 'connected',
     user: session.connectionStatus === 'connected' ? (session.connectedUser || '') : '',
     hasQr: Boolean(session.qrCodeDataUrl),
-    qr: session.qrCodeDataUrl || '',
+    qr: verifyLinkTicket(req.query.ticket, tenantId) ? (session.qrCodeDataUrl || '') : '',
     filterMode: 'bimodal_intelligent',
     trackedOutboundCount: outboundPhonesMap.size,
     processedMessagesCount: processedMessageIds.size,
@@ -1347,6 +1338,21 @@ app.get('/api/whatsapp/sync-retroactive', async (req, res) => {
   }
 });
 
+// Tenant-scoped follow-up summary. Legacy global tracker files are never exposed.
+app.get(['/api/whatsapp/outbound-tracker-full', '/api/whatsapp/outbound-stats'], async (req, res) => {
+  try {
+    const tenantId = requireTenant(req.query.tenant || req.query.tenantId);
+    const rows = await databaseRequest('leads?tenant_id=eq.' + encodeURIComponent(tenantId) + '&outbound_tracking->>firstSentAt=not.is.null&select=id,name,phone,status,amount,outbound_tracking');
+    const entries = rows.map(row => ({ phone: row.phone, name: row.name, status: row.status, amount: row.amount, ...row.outbound_tracking }));
+    const now = Date.now();
+    const replied = entries.filter(entry => entry.replyCount > 0).length;
+    res.json({ tenantId, totalProspected: entries.length, replied, responseRate: entries.length ? (100 * replied / entries.length).toFixed(1) : '0',
+      recent24h: entries.filter(entry => now - entry.lastSentAt < 86400000).length,
+      cold48h: entries.filter(entry => now - entry.lastSentAt > 2 * 86400000 && !entry.replyCount).length,
+      dead7d: entries.filter(entry => now - entry.lastSentAt > 7 * 86400000 && !entry.replyCount).length, entries });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
 // Endpoint para registrar manualmente números contactados por script externo
 app.post('/api/whatsapp/register-outbound', (req, res) => {
   const { phones, snippet } = req.body || {};
@@ -1451,56 +1457,9 @@ app.get('/qr', (req, res) => {
   const tenantId = sanitizeTenantId(req.query.tenant || req.query.tenantId || req.query.client || 'kindev');
   const isK = tenantId === 'kindev';
   const clientLabel = isK ? 'Kindev' : tenantId.replace(/_/g, ' ').toUpperCase();
-  const expectedKey = getExpectedVinculationPin(tenantId);
-  const providedKey = String(req.query.key || req.query.pin || req.query.secret || '').trim().toUpperCase();
-
-  if (!providedKey || providedKey !== expectedKey) {
-    return res.send(`<!DOCTYPE html>
-<html lang="es">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Acceso Protegido — ${clientLabel}</title>
-  <script src="https://cdn.tailwindcss.com"></script>
-  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;700;800&display=swap" rel="stylesheet">
-  <style>body { font-family: 'Plus Jakarta Sans', sans-serif; }</style>
-</head>
-<body class="bg-slate-50 text-slate-900 min-h-screen flex flex-col items-center justify-center p-4">
-  <div class="max-w-md w-full bg-white rounded-3xl border border-slate-200 shadow-xl p-7 text-center space-y-5">
-    <div class="flex items-center justify-center gap-2 mb-1">
-      <img src="/logo.png" alt="Kindev Logo" class="h-8 object-contain" onerror="this.style.display='none'">
-      <span class="font-extrabold text-lg text-slate-900">Kindev Meta Ads</span>
-    </div>
-    <div class="w-14 h-14 bg-amber-100 text-amber-600 rounded-2xl flex items-center justify-center mx-auto text-2xl shadow-sm">
-      🔒
-    </div>
-    <div>
-      <span class="inline-block px-3 py-1 bg-slate-100 rounded-full text-xs font-bold text-slate-700 mb-2">Cuenta: ${clientLabel}</span>
-      <h2 class="text-xl font-black text-slate-900">Vinculación Protegida</h2>
-      <p class="text-xs text-slate-500 mt-1">
-        Para ver y escanear el código QR de esta cuenta, ingresa su <strong>Clave de Vinculación</strong> (disponible en el panel de Kindev Ads).
-      </p>
-    </div>
-    ${providedKey ? '<div class="p-2.5 rounded-xl bg-rose-50 border border-rose-200 text-xs text-rose-700 font-semibold">⚠️ Clave incorrecta para esta cuenta.</div>' : ''}
-    <form method="GET" action="/qr" class="space-y-3 pt-1">
-      <input type="hidden" name="tenant" value="${tenantId}" />
-      <input 
-        type="text" 
-        name="key" 
-        placeholder="Ej: ${expectedKey.slice(0, 4)}••••" 
-        required 
-        autocomplete="off"
-        class="w-full text-center tracking-widest font-mono text-base uppercase py-3 px-4 rounded-xl border border-slate-300 focus:outline-none focus:ring-2 focus:ring-amber-500 shadow-inner font-bold"
-      />
-      <button type="submit" class="w-full py-3 px-4 bg-slate-900 hover:bg-slate-800 text-white font-bold text-xs rounded-xl transition-all shadow-md active:scale-95">
-        Desbloquear Código QR ➔
-      </button>
-    </form>
-    <a href="https://kindevads.com" class="inline-block text-xs text-slate-400 hover:text-slate-700">Regresar al panel</a>
-  </div>
-</body>
-</html>`);
-  }
+  const ticket = String(req.query.ticket || '');
+  res.set('Cache-Control', 'no-store').set('Referrer-Policy', 'no-referrer');
+  if (!verifyLinkTicket(ticket, tenantId)) return res.status(401).send('<h2>Enlace de vinculación vencido</h2><p>Abre Vincular WhatsApp desde tu cuenta en <a href="https://kindevads.com">Kindev Ads</a>.</p>');
 
   const session = getOrCreateSession(tenantId);
 
@@ -1561,9 +1520,9 @@ app.get('/qr', (req, res) => {
         <a href="https://kindevads.com" target="_blank" class="py-2.5 px-6 rounded-xl bg-slate-900 text-white font-bold text-xs hover:bg-slate-800 transition-all shadow-md">
           Ir al Panel de Clientes ➔
         </a>
-        <a href="/api/whatsapp/disconnect?tenant=${tenantId}" onclick="return confirm('¿Seguro que deseas desconectar el WhatsApp de ${clientLabel}?')" class="text-xs text-rose-600 hover:underline">
+        <form method="POST" action="/api/whatsapp/relink?tenantId=${tenantId}&ticket=${encodeURIComponent(ticket)}"><input type="hidden" name="tenantId" value="${tenantId}"><button type="submit" onclick="return confirm('¿Seguro que deseas volver a vincular esta cuenta?')" class="text-xs text-rose-600 hover:underline">
           Desconectar este número
-        </a>
+        </button></form>
       </div>
     </div>
 
@@ -1573,7 +1532,7 @@ app.get('/qr', (req, res) => {
     const tenant = ${JSON.stringify(tenantId)};
     async function checkStatus() {
       try {
-        const res = await fetch('/api/whatsapp/status?tenant=' + encodeURIComponent(tenant));
+        const res = await fetch('/api/whatsapp/status?tenant=' + encodeURIComponent(tenant) + '&ticket=' + encodeURIComponent(${JSON.stringify(ticket)}));
         const data = await res.json();
         
         if (data.status === 'connected') {
@@ -1598,39 +1557,10 @@ app.get('/qr', (req, res) => {
   `);
 });
 
-// Endpoint para desconectar una sesión específica
-app.get('/api/whatsapp/disconnect', async (req, res) => {
-  const tenantId = sanitizeTenantId(req.query.tenant || req.query.tenantId || 'kindev');
-  const session = sessions.get(tenantId);
-  if (session) {
-    try {
-      if (session.sock) {
-        await session.sock.logout().catch(() => {});
-      }
-    } catch (e) {}
-    session.connectionStatus = 'initializing';
-    session.connectedUser = '';
-    session.qrCodeDataUrl = '';
-    session.sock = null;
-    if (tenantId === 'kindev') {
-      connectionStatus = 'initializing';
-      connectedUser = '';
-      qrCodeDataUrl = '';
-      globalSock = null;
-    }
-    updateFirestoreStatus(tenantId, 'disconnected', '', 'Sesión cerrada por el usuario');
-    try {
-      fs.rmSync(session.authDir, { recursive: true, force: true });
-    } catch (e) {}
-    setTimeout(() => startTenantWhatsAppBot(tenantId), 2000);
-  }
-  res.redirect(`/qr?tenant=${encodeURIComponent(tenantId)}`);
-});
-
 // Re-link exactly one socket. Archive its keys; never move the shared AUTH_DIR.
 app.post('/api/whatsapp/relink', async (req, res) => {
   try {
-    const tenantId = requireTenant(req.body?.tenantId);
+    const tenantId = requireTenant(req.body?.tenantId || req.query.tenantId);
     const session = sessions.get(tenantId) || getOrCreateSession(tenantId);
     clearTimeout(session.reconnectTimer);
     const previousSocket = session.sock;
@@ -1652,7 +1582,9 @@ app.post('/api/whatsapp/relink', async (req, res) => {
       archivedFiles++;
     }
     session.starting = false;
+    metrics.delete(tenantId);
     await startTenantWhatsAppBot(tenantId);
+    if (req.headers.accept?.includes('text/html')) return res.redirect('/qr?tenant=' + encodeURIComponent(tenantId) + '&ticket=' + encodeURIComponent(req.query.ticket || ''));
     res.json({ success: true, tenantId, archivedFiles, status: session.connectionStatus });
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
@@ -1667,7 +1599,7 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
 
   if (!phone) return res.status(400).json({ error: 'Teléfono inválido' });
 
-  const tenantId = req.query.tenant || req.query.client || body.tenantId || body.client || 'kindev';
+  const tenantId = requireTenant(req.query.tenant || body.tenantId);
 
   try {
     const saved = await saveLeadToFirestore({
