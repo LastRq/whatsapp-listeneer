@@ -11,7 +11,7 @@ import { installAccountRoutes, verifyAccountRequest, authorizeTenant, verifyLink
 import { createDurableInbox } from './durable-inbox.js';
 import { createTenantIngestion, createSupabaseRequest, requireTenant, tenantKey } from './tenant-ingestion.js';
 import { loadTenantConfig, sendMetaEvent, installMetaRoutes } from './meta-integration.js';
-const RELEASE = 'tenant-ingestion-20261108-auth';
+const RELEASE = 'tenant-ingestion-20261108-auth-baileys7';
 const metrics = new Map();
 function metric(tenant, reason) {
   const state = metrics.get(tenant) || { received: 0, saved: 0, failed: 0, lastReceivedAt: null, lastSavedAt: null, reasons: {} };
@@ -968,6 +968,8 @@ function getOrCreateSession(rawTenantId = 'kindev') {
     startTenantWhatsAppBot(tenantId).catch(err => {
       console.error(`[WhatsApp:${tenantId}] Error iniciando sesión:`, err);
     });
+  } else if (!session.sock && !session.starting) {
+    void startTenantWhatsAppBot(tenantId).catch(error => console.warn('[WhatsApp:' + tenantId + ']', error.message));
   }
   return session;
 }
@@ -984,6 +986,15 @@ async function startTenantWhatsAppBot(rawTenantId = 'kindev') {
       fs.mkdirSync(authDir, { recursive: true });
     }
 
+    // Preserve v6 keys independently before the automatic v7 LID migration.
+    const backup = path.join(AUTH_DIR, 'pre-v7-backup', tenantId);
+    if (!fs.existsSync(path.join(backup, '.complete'))) {
+      fs.mkdirSync(backup, { recursive: true, mode: 0o700 });
+      for (const entry of fs.readdirSync(authDir, { withFileTypes: true })) {
+        if (entry.isFile() && /^(creds\.json|(?:session|sender-key|pre-key|app-state-sync-key|app-state-sync-version|lid-mapping|device-list|tctoken)-.*\.json)$/.test(entry.name)) fs.copyFileSync(path.join(authDir, entry.name), path.join(backup, entry.name));
+      }
+      fs.writeFileSync(path.join(backup, '.complete'), new Date().toISOString());
+    }
     const { state, saveCreds } = await useMultiFileAuthState(authDir);
     const logger = pino({ level: 'warn', hooks: { logMethod(args, method, level) {
       const error = args.find(arg => typeof arg === 'object' && arg?.err)?.err;
@@ -995,6 +1006,7 @@ async function startTenantWhatsAppBot(rawTenantId = 'kindev') {
 
     const sock = makeWASocket({
       auth: state,
+      shouldIgnoreJid: jid => jid.endsWith('@g.us') || jid.includes('broadcast') || jid.endsWith('@newsletter'),
       logger,
       printQRInTerminal: false,
       browser: [`Kindev Ads (${tenantId})`, 'Chrome', '1.0.0'],
