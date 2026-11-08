@@ -1233,6 +1233,7 @@ app.get('/api/whatsapp/diagnostics', async (req, res) => {
         remoteKind: remote.split('@')[1], phoneSuffix: resolved.phone?.slice(-4) || '',
         messageTypes: Object.keys(msg.message || {}), protocolType: msg.message?.protocolMessage?.type,
         peerResultKinds: msg.message?.protocolMessage?.peerDataOperationRequestResponseMessage?.peerDataOperationResult?.map(result => Object.keys(result)),
+        peerResultStatuses: msg.message?.protocolMessage?.peerDataOperationRequestResponseMessage?.peerDataOperationResult?.map(result => result.mediaUploadResult),
         resendByteLengths: msg.message?.protocolMessage?.peerDataOperationRequestResponseMessage?.peerDataOperationResult?.map(result => result.placeholderMessageResendResponse?.webMessageInfoBytes?.length || 0), stubType: msg.messageStubType,
         stubReasons: (msg.messageStubParameters || []).map(value => String(value).replace(/\d{7,}/g, '[redacted]').slice(0, 120)) });
     }

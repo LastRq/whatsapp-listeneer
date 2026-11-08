@@ -39,10 +39,23 @@ export function createPlaceholderRecovery({ inbox, getSocket, onMetric = () => {
     if (!sock?.requestPlaceholderResend || inFlight.has(key) || (!force && (record.attempts >= 10 || record.nextRetryAt > now()))) return;
     inFlight.add(key);
     try {
+      const alternate = record.key.remoteJidAlt;
+      const requestKey = record.attempts % 2 === 1 && alternate?.endsWith('@s.whatsapp.net')
+        ? { ...record.key, remoteJid: alternate, remoteJidAlt: record.key.remoteJid }
+        : record.key;
       record.attempts++; record.nextRetryAt = now() + Math.min(record.attempts * 30000, 5 * 60000);
       inbox.put(record);
-      await sock.requestPlaceholderResend(record.key, { key: record.key, messageTimestamp: record.messageTimestamp, pushName: record.pushName });
+      await sock.requestPlaceholderResend(requestKey, { key: record.key, messageTimestamp: record.messageTimestamp, pushName: record.pushName });
       onMetric(record.tenantId, 'placeholder_requested');
+      // Some primary-phone versions look up message keys by PN rather than LID.
+      // If single-message recovery is insufficient, request this own chat's
+      // actual earlier history. The normal per-socket history handler ingests it.
+      if (record.attempts >= 2 && !record.historyRequested && sock.fetchMessageHistory) {
+        await sock.fetchMessageHistory(20, requestKey, record.messageTimestamp);
+        record.historyRequested = true;
+        inbox.put(record);
+        onMetric(record.tenantId, 'placeholder_history_requested');
+      }
     } catch { onMetric(record.tenantId, 'placeholder_request_failed'); }
     finally { inFlight.delete(key); }
   }
