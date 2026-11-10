@@ -58,6 +58,10 @@ try {
   const blacklist = await network(base + '/api/blacklist/add?tenantId=client_a', { method: 'POST', headers: { Authorization:'Bearer verified-client', 'Content-Type':'application/json' }, body: JSON.stringify({phone:'593987654321'}) });
   assert.equal(blacklist.status,200);
   assert.equal((await blacklist.json()).entry.tenantId,'client_a');
+  const relaxedJson = await network(base + '/api/blacklist/add?tenantId=client_a', { method: 'POST', headers: { Authorization:'Bearer verified-client', 'Content-Type':'application/json' }, body: "{ 'phone': '593987654321' }" });
+  assert.equal(relaxedJson.status,200);
+  const badJson = await network(base + '/api/blacklist/add?tenantId=client_a', { method: 'POST', headers: { Authorization:'Bearer verified-client', 'Content-Type':'application/json' }, body: "not-json" });
+  assert.equal(badJson.status,400);
   const conflict = await network(base + '/api/blacklist/add?tenant=client_a', { method:'POST', headers:{Authorization:'Bearer verified-client','Content-Type':'application/json'}, body:JSON.stringify({tenantId:'kindev',phone:'593987654321'}) });
   assert.equal(conflict.status,400);
   const own = await (await network(base + '/api/whatsapp/chat/593987654321?tenant=kindev', { headers: { 'x-admin-key': 'test-admin' } })).json();

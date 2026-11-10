@@ -176,7 +176,25 @@ async function dispatchCapiBusinessMessagingLead({ phone, name, remoteJid, text 
 
 app.set('trust proxy', 1);
 app.use(cors({ origin: ['https://kindevads.com', 'https://www.kindevads.com', 'https://kindevads.web.app'] }));
-app.use(express.json({ limit: '256kb' }));
+app.use((req, res, next) => {
+  express.json({ limit: '256kb' })(req, res, (err) => {
+    if (err) {
+      if (err instanceof SyntaxError && err.status === 400 && typeof err.body === 'string') {
+        try {
+          const relaxed = err.body
+            .replace(/'/g, '"')
+            .replace(/([{,]\s*)([a-zA-Z0-9_$]+)\s*:/g, '$1"$2":');
+          req.body = JSON.parse(relaxed);
+          return next();
+        } catch {
+          return res.status(400).json({ error: 'Cuerpo de solicitud JSON inválido o malformado.' });
+        }
+      }
+      return res.status(400).json({ error: 'Solicitud malformada.' });
+    }
+    next();
+  });
+});
 app.use(express.urlencoded({ extended: false }));
 installMetaRoutes(app);
 installAccountRoutes(app);
@@ -197,7 +215,7 @@ app.use('/api', async (req, res, next) => {
   const supplied = String(req.headers['x-admin-key'] || '');
   try {
     if (expected && Buffer.byteLength(supplied) === Buffer.byteLength(expected) && crypto.timingSafeEqual(Buffer.from(supplied), Buffer.from(expected))) { canonicalize(); return next(); }
-    if (req.path === '/whatsapp/relink' && verifyLinkTicket(req.query.ticket, tenant)) { canonicalize(); return next(); }
+    if (req.path === '/whatsapp/relink' && verifyLinkTicket(req.query.ticket || req.body?.ticket, tenant)) { canonicalize(); return next(); }
     const member = await verifyAccountRequest(req);
     authorizeTenant(member, tenant);
     if (!req.path.startsWith('/whatsapp/') && !req.path.startsWith('/blacklist')) throw new Error('Operación administrativa.');
@@ -1042,7 +1060,7 @@ async function startTenantWhatsAppBot(rawTenantId = 'kindev') {
       const text = args.map(arg => typeof arg === 'string' ? arg : arg?.err?.message || '').join(' ');
       if (/decrypt|Bad MAC|session|prekey/i.test(text)) { const state = metric(tenantId, 'decryption_error'); state.lastTransportError = String(error?.message || text).replace(/\d{7,}/g, '[redacted]').slice(0, 160); }
       // Log only category and tenant; never serialize encryption keys or message contents.
-      if (level >= 50) console.warn('[WhatsApp:' + tenantId + '] Error de transporte/descifrado: ' + (error?.name || 'Error'));
+      if (level >= 50 && /decrypt|Bad MAC|session|prekey/i.test(text)) console.warn('[WhatsApp:' + tenantId + '] Error de transporte/descifrado: ' + (error?.name || 'Error'));
     } } });
 
     const sock = makeWASocket({
@@ -1103,12 +1121,35 @@ async function startTenantWhatsAppBot(rawTenantId = 'kindev') {
         } else {
           session.connectionStatus = 'initializing';
           session.connectedUser = '';
+          session.qrCodeDataUrl = '';
           if (tenantId === 'kindev') {
             connectionStatus = 'initializing';
             connectedUser = '';
+            qrCodeDataUrl = '';
+            globalSock = null;
           }
           updateFirestoreStatus(tenantId, 'disconnected', '', 'Sesión cerrada');
-          session.connectionStatus = 'disconnected';
+          // Archivar credenciales expiradas o desvinculadas para regenerar código QR limpio
+          const archive = path.join(AUTH_DIR, 'relink-backups', tenantId, String(Date.now()));
+          try {
+            fs.mkdirSync(archive, { recursive: true, mode: 0o700 });
+            const authRoot = path.resolve(session.authDir);
+            for (const entry of fs.readdirSync(authRoot, { withFileTypes: true })) {
+              if (!entry.isFile() || !/^(creds\.json|(?:session|sender-key|pre-key|app-state-sync-key|app-state-sync-version|lid-mapping|device-list|tctoken)-.*\.json)$/.test(entry.name)) continue;
+              const source = path.resolve(authRoot, entry.name);
+              if (path.dirname(source) === authRoot) {
+                try { fs.renameSync(source, path.join(archive, entry.name)); } catch {}
+              }
+            }
+          } catch (e) {
+            console.warn(`[WhatsApp:${tenantId}] Error archivando sesión desvinculada:`, e.message);
+          }
+          clearTimeout(session.reconnectTimer);
+          session.reconnectTimer = setTimeout(() => {
+            startTenantWhatsAppBot(tenantId).catch(err => {
+              console.error(`[WhatsApp:${tenantId}] Error reiniciando para nuevo QR:`, err.message);
+            });
+          }, 1500);
         }
       } else if (connection === 'open') {
         console.log(`✅ [WhatsApp:${tenantId}] Conexión establecida con éxito!`);
