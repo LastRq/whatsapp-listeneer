@@ -47,8 +47,27 @@ test('Purchase never invents a value and dates are not moved to evade the API wi
 test('CTWA attribution requires actual click and business identifiers; otherwise uses chat', () => {
  assert.equal(prepareMetaEvent({ ...params, actionSource: 'business_messaging' }, cfg).data[0].action_source, 'chat');
  const event = prepareMetaEvent({ ...params, actionSource: 'business_messaging', ctwaClid: 'real-click' }, { ...cfg, pageId: '123' }).data[0];
- assert.equal(event.action_source, 'business_messaging'); assert.equal(event.messaging_channel, 'whatsapp');
+ assert.equal(event.action_source, 'business_messaging'); assert.equal(event.event_name, 'LeadSubmitted'); assert.equal(event.messaging_channel, 'whatsapp');
  assert.equal(event.user_data.ctwa_clid, 'real-click'); assert.equal(event.user_data.page_id, '123');
+ const purchase = prepareMetaEvent({ ...params, eventName: 'Purchase', value: 50, actionSource: 'business_messaging', ctwaClid: 'real-click' }, { ...cfg, pageId: '123' }).data[0];
+ assert.equal(purchase.event_name, 'Purchase'); assert.equal(purchase.action_source, 'business_messaging');
+});
+test('sendMetaEvent falls back to chat when Meta rejects business_messaging dataset linkage (2804131)', async () => {
+ const payloads = [];
+ const fetcher = async (_url, options) => {
+  const body = JSON.parse(options.body);
+  payloads.push(body.data[0]);
+  if (body.data[0].action_source === 'business_messaging') {
+   return Response.json({ error: { message: 'Invalid parameter', code: 100, error_subcode: 2804131, error_user_msg: 'Dataset sin pagina asociada' } }, { status: 400 });
+  }
+  return Response.json({ events_received: 1, fbtrace_id: 'fallback-trace' });
+ };
+ const res = await sendMetaEvent({ ...params, eventName: 'Purchase', value: 50, actionSource: 'business_messaging', ctwaClid: 'real-click' }, { ...cfg, pageId: '588188457716986' }, { fetcher });
+ assert.equal(payloads.length, 2);
+ assert.equal(payloads[0].action_source, 'business_messaging');
+ assert.equal(payloads[1].action_source, 'chat'); assert.equal(payloads[1].event_name, 'Purchase');
+ assert.equal(payloads[1].user_data.ctwa_clid, undefined); assert.equal(payloads[1].user_data.page_id, undefined);
+ assert.equal(res.actionSource, 'chat'); assert.equal(res.eventsReceived, 1); assert.match(res.warnings[0], /Fallback a chat/);
 });
 test('API acceptance requires a positive events_received; token is never in the URL', async () => {
  let requested;

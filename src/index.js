@@ -745,7 +745,7 @@ async function deliverTenantLead(lead) {
     const result = await sendMetaEvent({ eventName: 'Lead', phone: lead.phone, name: lead.name,
       leadId: lead.id, eventId: lead.event_id, eventTime: Math.floor(new Date(lead.created_at).getTime() / 1000),
       actionSource: 'business_messaging', ctwaClid: lead.ctwa_clid }, config);
-    const event = { eventName: 'Lead', date: new Date().toISOString(), eventId: lead.event_id,
+    const event = { eventName: result.eventName || 'Lead', date: new Date().toISOString(), eventId: lead.event_id,
       tenantId: lead.tenant_id, datasetId: result.datasetId, fbtraceId: result.fbtraceId,
       testMode: result.testMode, eventsReceived: result.eventsReceived, actionSource: result.actionSource };
     const rows = await databaseRequest('leads?id=eq.' + encodeURIComponent(lead.id) + '&tenant_id=eq.' + encodeURIComponent(lead.tenant_id) + '&select=meta_events');
@@ -779,7 +779,7 @@ setInterval(async () => {
   if (retryingCapi) return;
   retryingCapi = true;
   try {
-    const rows = await databaseRequest('leads?meta_delivery->>status=eq.pending&order=created_at.asc&limit=30');
+    const rows = await databaseRequest('leads?meta_delivery->>status=eq.pending&order=created_at.asc&limit=100');
     for (const lead of rows) {
       if (Date.now() - new Date(lead.created_at).getTime() > 7 * 86400000) {
         await databaseRequest('leads?id=eq.' + encodeURIComponent(lead.id) + '&tenant_id=eq.' + encodeURIComponent(lead.tenant_id), {

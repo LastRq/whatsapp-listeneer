@@ -72,9 +72,10 @@ export function phoneNumber(raw) {
   else if (p.length === 9 && p.startsWith('9')) p = '593' + p;
   return p;
 }
+const BUSINESS_MESSAGING_FALLBACK_SUBCODES = new Set([2804066, 2804087, 2804116, 2804131, 2804132]);
 export function prepareMetaEvent(params, config, now = Date.now()) {
   if (!/^\d+$/.test(config.datasetId || '') || !config.accessToken?.trim()) throw new Error('Falta dataset o token de esta cuenta.');
-  if (!['Lead', 'Contact', 'Purchase'].includes(params.eventName)) throw new Error('Evento no permitido.');
+  if (!['Lead', 'LeadSubmitted', 'Contact', 'Purchase'].includes(params.eventName)) throw new Error('Evento no permitido.');
   const testMode = params.testMode === true || config.testMode === true;
   const testCode = String(params.testEventCode || config.testEventCode || '').trim();
   if (testMode && !testCode) throw new Error('Falta el código de Probar eventos; no se enviará a producción.');
@@ -113,7 +114,10 @@ export function prepareMetaEvent(params, config, now = Date.now()) {
     if (config.pageId) userData.page_id = config.pageId;
     if (config.whatsappBusinessAccountId) userData.whatsapp_business_account_id = config.whatsappBusinessAccountId;
   }
-  const event = { event_name: params.eventName, event_time: Math.floor(timestamp), event_id: eventId, action_source: actionSource, user_data: userData };
+  const eventName = businessMessaging && params.eventName === 'Lead'
+    ? 'LeadSubmitted'
+    : (!businessMessaging && params.eventName === 'LeadSubmitted' ? 'Lead' : params.eventName);
+  const event = { event_name: eventName, event_time: Math.floor(timestamp), event_id: eventId, action_source: actionSource, user_data: userData };
   if (businessMessaging) event.messaging_channel = 'whatsapp';
   if (actionSource === 'website') event.event_source_url = params.eventSourceUrl;
   if (params.eventName === 'Purchase') {
@@ -131,20 +135,43 @@ export async function graphRequest(path, token, { fetcher = fetch, ...options } 
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok || data.error) {
-    const error = new Error(data.error?.message || 'Meta respondió HTTP ' + res.status);
+    const detail = data.error?.error_user_msg || data.error?.error_user_title || '';
+    const message = data.error?.message ? (detail ? `${data.error.message}: ${detail}` : data.error.message) : 'Meta respondió HTTP ' + res.status;
+    const error = new Error(message);
     error.code = data.error?.code; error.subcode = data.error?.error_subcode; error.traceId = data.error?.fbtrace_id;
+    error.userTitle = data.error?.error_user_title || ''; error.userMsg = data.error?.error_user_msg || '';
     throw error;
   }
   return data;
 }
 export async function sendMetaEvent(params, config, dependencies = {}) {
-  const body = prepareMetaEvent(params, config, dependencies.now?.() || Date.now());
-  const data = await graphRequest(config.datasetId + '/events', config.accessToken, { ...dependencies, method: 'POST', body: JSON.stringify(body) });
+  const now = dependencies.now?.() || Date.now();
+  const body = prepareMetaEvent(params, config, now);
+  let data;
+  let fallbackNotice = '';
+  try {
+    data = await graphRequest(config.datasetId + '/events', config.accessToken, { ...dependencies, method: 'POST', body: JSON.stringify(body) });
+  } catch (error) {
+    const canFallbackToChat = body.data[0].action_source === 'business_messaging'
+      && (BUSINESS_MESSAGING_FALLBACK_SUBCODES.has(Number(error.subcode))
+        || /página asociada|associated.*page|WhatsApp Business Account/i.test(error.userMsg || error.message || ''));
+    if (!canFallbackToChat) throw error;
+    let fallbackBody;
+    try {
+      fallbackBody = prepareMetaEvent({ ...params, actionSource: 'chat' }, config, now);
+    } catch {
+      throw error;
+    }
+    data = await graphRequest(config.datasetId + '/events', config.accessToken, { ...dependencies, method: 'POST', body: JSON.stringify(fallbackBody) });
+    body.data[0] = fallbackBody.data[0];
+    fallbackNotice = 'Fallback a chat por validación Meta BM: ' + error.message;
+  }
   if (!(Number(data.events_received) > 0)) throw new Error('Meta no confirmó la recepción del evento.');
+  const warnings = [...(data.messages || []), ...(fallbackNotice ? [fallbackNotice] : [])];
   return {
     tenantId: config.tenantId, datasetId: config.datasetId, eventsReceived: Number(data.events_received),
-    fbtraceId: data.fbtrace_id || '', warnings: data.messages || [], eventId: body.data[0].event_id, actionSource: body.data[0].action_source,
-    testMode: !!body.test_event_code, checkedAt: new Date().toISOString()
+    fbtraceId: data.fbtrace_id || '', warnings, eventId: body.data[0].event_id, eventName: body.data[0].event_name,
+    actionSource: body.data[0].action_source, testMode: !!body.test_event_code, checkedAt: new Date().toISOString()
   };
 }
 export async function checkMetaConfig(config) {
