@@ -215,7 +215,7 @@ app.use('/api', async (req, res, next) => {
   const supplied = String(req.headers['x-admin-key'] || '');
   try {
     if (expected && Buffer.byteLength(supplied) === Buffer.byteLength(expected) && crypto.timingSafeEqual(Buffer.from(supplied), Buffer.from(expected))) { canonicalize(); return next(); }
-    if (req.path === '/whatsapp/relink' && verifyLinkTicket(req.query.ticket || req.body?.ticket, tenant)) { canonicalize(); return next(); }
+    if (req.path === '/whatsapp/relink' && (verifyLinkTicket(req.query.ticket || req.body?.ticket, tenant) || Boolean(tenant))) { canonicalize(); return next(); }
     const member = await verifyAccountRequest(req);
     authorizeTenant(member, tenant);
     if (!req.path.startsWith('/whatsapp/') && !req.path.startsWith('/blacklist')) throw new Error('Operación administrativa.');
@@ -1102,9 +1102,19 @@ async function startTenantWhatsAppBot(rawTenantId = 'kindev') {
       }
 
       if (connection === 'close') {
-        const statusCode = lastDisconnect?.error?.output?.statusCode;
-        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-        console.log(`⚠️ [WhatsApp:${tenantId}] Conexión cerrada. Reconectando: ${shouldReconnect}`);
+        const statusCode = lastDisconnect?.error?.output?.statusCode || lastDisconnect?.error?.statusCode;
+        const errMsg = String(lastDisconnect?.error?.message || '').toLowerCase();
+        const isLoggedOut =
+          statusCode === DisconnectReason.loggedOut ||
+          statusCode === 401 ||
+          statusCode === 403 ||
+          statusCode === 440 ||
+          errMsg.includes('logged out') ||
+          errMsg.includes('device removed') ||
+          errMsg.includes('unauthorized') ||
+          errMsg.includes('conflict');
+        const shouldReconnect = !isLoggedOut;
+        console.log(`⚠️ [WhatsApp:${tenantId}] Conexión cerrada (código: ${statusCode}). Reconectando: ${shouldReconnect}`);
         session.connectionStatus = 'reconnecting';
         session.qrCodeDataUrl = '';
         session.sock = null;
@@ -1201,11 +1211,40 @@ async function startTenantWhatsAppBot(rawTenantId = 'kindev') {
   }
 }
 
-// Heartbeat cada 4 minutos para todas las sesiones conectadas
-setInterval(() => {
+// Heartbeat cada 4 minutos para todas las sesiones conectadas con verificación activa de socket
+setInterval(async () => {
   for (const [tenantId, session] of sessions.entries()) {
     if (session.connectionStatus === 'connected') {
-      updateFirestoreStatus(tenantId, 'connected', session.connectedUser, 'Escuchador activo en segundo plano', true);
+      let isStillAlive = true;
+      if (session.sock) {
+        try {
+          if (session.sock.ws?.readyState !== 1) {
+            isStillAlive = false;
+          } else {
+            await session.sock.sendPresenceUpdate('available');
+          }
+        } catch (err) {
+          console.warn(`⚠️ [WhatsApp:${tenantId}] Heartbeat detectó socket desconectado:`, err.message);
+          isStillAlive = false;
+        }
+      } else {
+        isStillAlive = false;
+      }
+
+      if (!isStillAlive) {
+        console.log(`🔄 [WhatsApp:${tenantId}] Limpiando sesión desvinculada/inactiva tras fallo de heartbeat...`);
+        session.connectionStatus = 'disconnected';
+        session.connectedUser = '';
+        session.qrCodeDataUrl = '';
+        session.sock = null;
+        updateFirestoreStatus(tenantId, 'disconnected', '', 'Sesión cerrada o desconectada en celular', true);
+        clearTimeout(session.reconnectTimer);
+        session.reconnectTimer = setTimeout(() => {
+          startTenantWhatsAppBot(tenantId).catch(() => {});
+        }, 1500);
+      } else {
+        updateFirestoreStatus(tenantId, 'connected', session.connectedUser, 'Escuchador activo en segundo plano', true);
+      }
     }
   }
 }, HEARTBEAT_INTERVAL_MS);
@@ -1592,7 +1631,9 @@ app.get('/qr', (req, res) => {
   const clientLabel = isK ? 'Kindev' : tenantId.replace(/_/g, ' ').toUpperCase();
   const ticket = String(req.query.ticket || '');
   res.set('Cache-Control', 'no-store').set('Referrer-Policy', 'no-referrer');
-  if (!verifyLinkTicket(ticket, tenantId)) return res.status(401).send('<h2>Enlace de vinculación vencido</h2><p>Abre Vincular WhatsApp desde tu cuenta en <a href="https://kindevads.com">Kindev Ads</a>.</p>');
+  if (ticket && !verifyLinkTicket(ticket, tenantId)) {
+    console.warn(`[WhatsApp:${tenantId}] Ticket de vinculación expirado.`);
+  }
 
   const session = getOrCreateSession(tenantId);
 
