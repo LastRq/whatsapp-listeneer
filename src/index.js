@@ -760,7 +760,9 @@ async function deliverTenantLead(lead) {
     });
   }
 }
-const ingestion = createTenantIngestion({ request: databaseRequest, deliver: deliverTenantLead, inbox: createDurableInbox(path.join(AUTH_DIR, 'ingestion-inbox')) });
+// Protocolo Kindev Ads 2026: Silencio CAPI en mensajes entrantes de WhatsApp.
+// Ningún saludo o chat inicial dispara 'Lead'; solo 'Purchase' se envía al cotizar en el CRM.
+const ingestion = createTenantIngestion({ request: databaseRequest, deliver: deliverTenantLead, inbox: createDurableInbox(path.join(AUTH_DIR, 'ingestion-inbox')), autoDispatchLead: false });
 setInterval(() => { void ingestion.drain(); }, 60000).unref();
 void ingestion.drain();
 async function saveLeadToFirestore(payload) {
@@ -774,22 +776,7 @@ const placeholderRecovery = createPlaceholderRecovery({
 });
 setInterval(() => { void placeholderRecovery.retry(); }, 30000).unref();
 
-let retryingCapi = false;
-setInterval(async () => {
-  if (retryingCapi) return;
-  retryingCapi = true;
-  try {
-    const rows = await databaseRequest('leads?meta_delivery->>status=eq.pending&order=created_at.asc&limit=100');
-    for (const lead of rows) {
-      if (Date.now() - new Date(lead.created_at).getTime() > 7 * 86400000) {
-        await databaseRequest('leads?id=eq.' + encodeURIComponent(lead.id) + '&tenant_id=eq.' + encodeURIComponent(lead.tenant_id), {
-          method: 'PATCH', body: { meta_delivery: { ...lead.meta_delivery, status: 'expired' } }
-        });
-      } else await deliverTenantLead(lead);
-    }
-  } catch (e) { console.warn('[CAPI retry]', e.message); }
-  finally { retryingCapi = false; }
-}, 30 * 60 * 1000).unref();
+// Reintento automático de 'Lead' desactivado: los prospectos nuevos solo entrenan a Meta vía 'Purchase' al cotizar.
 
 // Buffer en memoria de mensajes recientes para consulta retroactiva (últimos 300)
 const recentMessagesBuffer = [];

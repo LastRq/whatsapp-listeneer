@@ -98,3 +98,54 @@ test('history and diagnostic recovery save content without sending a new product
   assert.equal(h.rows[0].meta_delivery.status, 'skipped');
   assert.equal(h.rows[0].meta_delivery.reason, 'history_recovery');
 });
+test('leadMinMessages=3 waits until the 3rd incoming chat before dispatching CAPI Lead and never duplicates on 4th', async () => {
+  const rows = [];
+  const events = [];
+  const request = async (resource, options = {}) => {
+    const url = new URL('https://db.test/' + resource);
+    const tenant = url.searchParams.get('tenant_id')?.slice(3);
+    if (options.method === 'POST') { rows.push(structuredClone(options.body)); return [structuredClone(options.body)]; }
+    const matching = rows.filter(row => row.tenant_id === tenant && (!url.searchParams.has('id') || row.id === url.searchParams.get('id').slice(3)));
+    if (options.method === 'PATCH') { for (const row of matching) Object.assign(row, options.body); }
+    return structuredClone(matching);
+  };
+  const ingestion = createTenantIngestion({ request, deliver: async row => events.push(row), now: () => '2026-11-25T11:30:00.000Z', leadMinMessages: 3 });
+  await ingestion.save({ ...contact, tenantId: 'gabriel_miranda_gi1yk', messageId: 'M1', message: 'Hola info' });
+  assert.equal(rows.length, 1);
+  assert.equal(events.length, 0);
+  assert.equal(rows[0].meta_delivery.status, 'waiting_threshold');
+  await ingestion.save({ ...contact, tenantId: 'gabriel_miranda_gi1yk', messageId: 'M2', message: 'Cuánto cuesta?' });
+  assert.equal(events.length, 0);
+  assert.equal(rows[0].meta_delivery.status, 'waiting_threshold');
+  await ingestion.save({ ...contact, tenantId: 'gabriel_miranda_gi1yk', messageId: 'M3', message: 'Sí quiero agendar' });
+  assert.equal(events.length, 1);
+  assert.equal(rows[0].meta_delivery.status, 'pending');
+  // Simulate Meta acceptance before 4th message
+  rows[0].meta_delivery.status = 'accepted';
+  rows[0].meta_events = [{ eventName: 'Lead' }];
+  await ingestion.save({ ...contact, tenantId: 'gabriel_miranda_gi1yk', messageId: 'M4', message: 'Gracias' });
+  assert.equal(events.length, 1);
+  assert.equal(rows[0].meta_delivery.status, 'accepted');
+});
+test('autoDispatchLead=false never dispatches CAPI Lead on incoming WhatsApp messages (Purchase-only protocol)', async () => {
+  const rows = [];
+  const events = [];
+  const request = async (resource, options = {}) => {
+    const url = new URL('https://db.test/' + resource);
+    const tenant = url.searchParams.get('tenant_id')?.slice(3);
+    if (options.method === 'POST') { rows.push(structuredClone(options.body)); return [structuredClone(options.body)]; }
+    const matching = rows.filter(row => row.tenant_id === tenant && (!url.searchParams.has('id') || row.id === url.searchParams.get('id').slice(3)));
+    if (options.method === 'PATCH') { for (const row of matching) Object.assign(row, options.body); }
+    return structuredClone(matching);
+  };
+  const ingestion = createTenantIngestion({ request, deliver: async row => events.push(row), now: () => '2026-11-26T12:00:00.000Z', autoDispatchLead: false });
+  await ingestion.save({ ...contact, tenantId: 'gabriel_miranda_gi1yk', messageId: 'M1', message: 'Hola', adInfo: { ctwaClid: 'ctwa_123' } });
+  await ingestion.save({ ...contact, tenantId: 'gabriel_miranda_gi1yk', messageId: 'M2', message: 'Precio' });
+  await ingestion.save({ ...contact, tenantId: 'gabriel_miranda_gi1yk', messageId: 'M3', message: 'Quiero cita' });
+  assert.equal(rows.length, 1);
+  assert.equal(events.length, 0);
+  assert.equal(rows[0].ctwa_clid, 'ctwa_123');
+  assert.equal(rows[0].whatsapp_delivery.inboundCount, 3);
+  assert.equal(rows[0].meta_delivery.status, 'skipped');
+  assert.equal(rows[0].meta_delivery.reason, 'purchase_only_protocol');
+});

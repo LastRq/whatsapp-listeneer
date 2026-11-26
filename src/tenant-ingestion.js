@@ -8,7 +8,9 @@ export function requireTenant(value) {
 // The phone, message id and lock always belong to the receiving socket's tenant.
 export const tenantKey = (tenant, value) => JSON.stringify([requireTenant(tenant), String(value)]);
 
-export function createTenantIngestion({ request, inbox, mirror = async () => {}, deliver = async () => {}, now = () => new Date().toISOString() }) {
+export function createTenantIngestion({ request, inbox, mirror = async () => {}, deliver = async () => {}, now = () => new Date().toISOString(), leadMinMessages = 1, autoDispatchLead = true }) {
+  const minMessagesForLead = Math.max(1, Number(leadMinMessages) || 1);
+  const dispatchLeadEnabled = Boolean(autoDispatchLead);
   const locks = new Map();
   async function save(payload) {
     const tenant = requireTenant(payload.tenantId);
@@ -24,21 +26,43 @@ export function createTenantIngestion({ request, inbox, mirror = async () => {},
       const ids = Array.isArray(existing?.whatsapp_message_ids) ? existing.whatsapp_message_ids : [];
       if (!payload.placeholder && existing && payload.messageId && ids.includes(payload.messageId)) return { saved: true, created: false, id: existing.id };
       const confirmedIds = !payload.placeholder && payload.messageId ? [...ids, payload.messageId].slice(-200) : ids;
+      const previousInboundCount = Number(existing?.whatsapp_delivery?.inboundCount ?? ids.length) || 0;
+      const inboundCount = payload.placeholder ? previousInboundCount : Math.max(confirmedIds.length, previousInboundCount + 1);
       const pending = new Set(existing?.whatsapp_delivery?.pendingIds || []);
       if (payload.messageId) { if (payload.placeholder) pending.add(payload.messageId); else pending.delete(payload.messageId); }
-      const delivery = { status: pending.size ? 'pending' : 'available', pendingIds: [...pending].slice(-200), updatedAt: timestamp };
+      const delivery = { status: pending.size ? 'pending' : 'available', pendingIds: [...pending].slice(-200), inboundCount, updatedAt: timestamp };
       const pendingLabel = '[WhatsApp: contenido pendiente de recuperación]';
       const previousNotes = String(existing?.notes || '').replace(pendingLabel, '').trim();
       const message = payload.placeholder ? '' : String(payload.notes || payload.message || '').slice(0, 1200);
       const notes = [previousNotes, message ? timestamp + ' ' + message : '', pending.size ? pendingLabel : ''].filter(Boolean).join('\n').slice(-10000);
-      const resumeMeta = !payload.placeholder && existing?.meta_delivery?.status === 'waiting_message';
-      const metaDelivery = payload.placeholder ? { status: 'waiting_message', eventId: existing?.event_id }
-        : payload.suppressMeta ? { status: 'skipped', reason: payload.suppressReason || 'operator_test', eventId: existing?.event_id }
-        : { status: 'pending', eventId: existing?.event_id };
+      const alreadySentLead = existing?.meta_delivery?.status === 'accepted'
+        || (Array.isArray(existing?.meta_events) && existing.meta_events.some(e => e?.eventName === 'Lead' || e?.eventName === 'LeadSubmitted'));
+      const reachedLeadThreshold = inboundCount >= minMessagesForLead;
+      const waitingStates = new Set(['waiting_message', 'waiting_threshold']);
+      const canTriggerLead = dispatchLeadEnabled && !payload.placeholder && !payload.suppressMeta && !alreadySentLead && reachedLeadThreshold
+        && (!existing || waitingStates.has(existing?.meta_delivery?.status) || !existing?.meta_delivery?.status);
+      const computedEventId = existing?.event_id || ('wa_lead_wa_' + crypto.createHash('sha256').update(key).digest('hex').slice(0, 40));
+      const metaDelivery = payload.placeholder
+        ? (existing?.meta_delivery && alreadySentLead ? existing.meta_delivery : { status: 'waiting_message', eventId: computedEventId })
+        : !dispatchLeadEnabled
+        ? (existing?.meta_delivery && alreadySentLead ? existing.meta_delivery : { status: 'skipped', reason: payload.suppressReason || 'purchase_only_protocol', eventId: computedEventId })
+        : payload.suppressMeta
+        ? (existing?.meta_delivery && alreadySentLead ? existing.meta_delivery : { status: 'skipped', reason: payload.suppressReason || 'operator_test', eventId: computedEventId })
+        : alreadySentLead
+        ? existing.meta_delivery
+        : !reachedLeadThreshold
+        ? { status: 'waiting_threshold', inboundCount, minMessages: minMessagesForLead, eventId: computedEventId }
+        : { status: 'pending', eventId: computedEventId };
       let lead;
       if (existing) {
+        const shouldPatchMeta = !alreadySentLead && (
+          !dispatchLeadEnabled
+          || payload.suppressMeta
+          || waitingStates.has(existing?.meta_delivery?.status)
+          || !existing?.meta_delivery?.status
+        );
         const patch = { notes, last_contact_date: timestamp, whatsapp_message_ids: confirmedIds, whatsapp_delivery: delivery,
-          ...(resumeMeta ? { meta_delivery: metaDelivery } : {}),
+          ...(shouldPatchMeta ? { meta_delivery: metaDelivery } : {}),
           ...(existing.outbound_tracking?.firstSentAt ? { outbound_tracking: { ...existing.outbound_tracking,
             replyCount: (existing.outbound_tracking.replyCount || 0) + 1, lastReplyAt: Date.parse(timestamp) } } : {}),
           ...(payload.adInfo?.ctwaClid && !existing.ctwa_clid ? { ctwa_clid: payload.adInfo.ctwaClid } : {}) };
@@ -61,7 +85,7 @@ export function createTenantIngestion({ request, inbox, mirror = async () => {},
       }
       // CRM capture succeeds independently of Firebase quota or Meta availability.
       Promise.resolve().then(() => mirror(lead)).catch(e => console.warn('[Mirror]', e.message));
-      if ((!existing || resumeMeta) && !payload.placeholder && !payload.suppressMeta) Promise.resolve().then(() => deliver(lead)).catch(e => console.warn('[CAPI]', e.message));
+      if (canTriggerLead) Promise.resolve().then(() => deliver(lead)).catch(e => console.warn('[CAPI]', e.message));
       return { saved: true, created: !existing, id: lead.id };
     });
     locks.set(key, operation);
