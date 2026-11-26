@@ -743,7 +743,7 @@ async function deliverTenantLead(lead) {
   try {
     const config = await loadTenantConfig(lead.tenant_id);
     const result = await sendMetaEvent({ eventName: 'Lead', phone: lead.phone, name: lead.name,
-      leadId: lead.id, eventId: lead.event_id, eventTime: Math.floor(new Date(lead.created_at).getTime() / 1000),
+      leadId: lead.id, eventId: lead.event_id, eventTime: Math.floor(new Date(lead.last_contact_date || lead.created_at).getTime() / 1000),
       actionSource: 'business_messaging', ctwaClid: lead.ctwa_clid }, config);
     const event = { eventName: result.eventName || 'Lead', date: new Date().toISOString(), eventId: lead.event_id,
       tenantId: lead.tenant_id, datasetId: result.datasetId, fbtraceId: result.fbtraceId,
@@ -760,9 +760,8 @@ async function deliverTenantLead(lead) {
     });
   }
 }
-// Protocolo Kindev Ads 2026: Silencio CAPI en mensajes entrantes de WhatsApp.
-// Ningún saludo o chat inicial dispara 'Lead'; solo 'Purchase' se envía al cotizar en el CRM.
-const ingestion = createTenantIngestion({ request: databaseRequest, deliver: deliverTenantLead, inbox: createDurableInbox(path.join(AUTH_DIR, 'ingestion-inbox')), autoDispatchLead: false });
+// Filtro anti-curiosos: solo se dispara CAPI 'Lead' cuando el cliente alcanza 3 mensajes entrantes.
+const ingestion = createTenantIngestion({ request: databaseRequest, deliver: deliverTenantLead, inbox: createDurableInbox(path.join(AUTH_DIR, 'ingestion-inbox')), leadMinMessages: 3 });
 setInterval(() => { void ingestion.drain(); }, 60000).unref();
 void ingestion.drain();
 async function saveLeadToFirestore(payload) {
@@ -776,7 +775,22 @@ const placeholderRecovery = createPlaceholderRecovery({
 });
 setInterval(() => { void placeholderRecovery.retry(); }, 30000).unref();
 
-// Reintento automático de 'Lead' desactivado: los prospectos nuevos solo entrenan a Meta vía 'Purchase' al cotizar.
+let retryingCapi = false;
+setInterval(async () => {
+  if (retryingCapi) return;
+  retryingCapi = true;
+  try {
+    const rows = await databaseRequest('leads?meta_delivery->>status=eq.pending&order=created_at.asc&limit=100');
+    for (const lead of rows) {
+      if (Date.now() - new Date(lead.created_at).getTime() > 7 * 86400000) {
+        await databaseRequest('leads?id=eq.' + encodeURIComponent(lead.id) + '&tenant_id=eq.' + encodeURIComponent(lead.tenant_id), {
+          method: 'PATCH', body: { meta_delivery: { ...lead.meta_delivery, status: 'expired' } }
+        });
+      } else await deliverTenantLead(lead);
+    }
+  } catch (e) { console.warn('[CAPI retry]', e.message); }
+  finally { retryingCapi = false; }
+}, 30 * 60 * 1000).unref();
 
 // Buffer en memoria de mensajes recientes para consulta retroactiva (últimos 300)
 const recentMessagesBuffer = [];

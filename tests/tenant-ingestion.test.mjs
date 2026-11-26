@@ -149,3 +149,25 @@ test('autoDispatchLead=false never dispatches CAPI Lead on incoming WhatsApp mes
   assert.equal(rows[0].meta_delivery.status, 'skipped');
   assert.equal(rows[0].meta_delivery.reason, 'purchase_only_protocol');
 });
+test('leadMinMessages=3 upgrades contacts previously marked purchase_only_protocol once they hit 3 messages, without touching history_recovery', async () => {
+  const rows = [];
+  const events = [];
+  const request = async (resource, options = {}) => {
+    const url = new URL('https://db.test/' + resource);
+    const tenant = url.searchParams.get('tenant_id')?.slice(3);
+    if (options.method === 'POST') { rows.push(structuredClone(options.body)); return [structuredClone(options.body)]; }
+    const matching = rows.filter(row => row.tenant_id === tenant && (!url.searchParams.has('id') || row.id === url.searchParams.get('id').slice(3)));
+    if (options.method === 'PATCH') { for (const row of matching) Object.assign(row, options.body); }
+    return structuredClone(matching);
+  };
+  const disabled = createTenantIngestion({ request, deliver: async row => events.push(row), now: () => '2026-11-26T12:05:00.000Z', autoDispatchLead: false });
+  await disabled.save({ ...contact, tenantId: 'gabriel_miranda_gi1yk', messageId: 'M1', message: 'Hola' });
+  assert.equal(events.length, 0);
+  const threshold = createTenantIngestion({ request, deliver: async row => events.push(row), now: () => '2026-11-26T12:10:00.000Z', leadMinMessages: 3 });
+  await threshold.save({ ...contact, tenantId: 'gabriel_miranda_gi1yk', messageId: 'M2', message: 'Info promo' });
+  assert.equal(events.length, 0);
+  assert.equal(rows[0].meta_delivery.status, 'waiting_threshold');
+  await threshold.save({ ...contact, tenantId: 'gabriel_miranda_gi1yk', messageId: 'M3', message: 'Agendar hoy' });
+  assert.equal(events.length, 1);
+  assert.equal(rows[0].meta_delivery.status, 'pending');
+});

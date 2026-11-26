@@ -39,8 +39,9 @@ export function createTenantIngestion({ request, inbox, mirror = async () => {},
         || (Array.isArray(existing?.meta_events) && existing.meta_events.some(e => e?.eventName === 'Lead' || e?.eventName === 'LeadSubmitted'));
       const reachedLeadThreshold = inboundCount >= minMessagesForLead;
       const waitingStates = new Set(['waiting_message', 'waiting_threshold']);
-      const canTriggerLead = dispatchLeadEnabled && !payload.placeholder && !payload.suppressMeta && !alreadySentLead && reachedLeadThreshold
-        && (!existing || waitingStates.has(existing?.meta_delivery?.status) || !existing?.meta_delivery?.status);
+      const wasPurchaseOnlySkipped = existing?.meta_delivery?.status === 'skipped' && existing?.meta_delivery?.reason === 'purchase_only_protocol';
+      const isEligibleState = !existing || waitingStates.has(existing?.meta_delivery?.status) || !existing?.meta_delivery?.status || wasPurchaseOnlySkipped;
+      const canTriggerLead = dispatchLeadEnabled && !payload.placeholder && !payload.suppressMeta && !alreadySentLead && reachedLeadThreshold && isEligibleState;
       const computedEventId = existing?.event_id || ('wa_lead_wa_' + crypto.createHash('sha256').update(key).digest('hex').slice(0, 40));
       const metaDelivery = payload.placeholder
         ? (existing?.meta_delivery && alreadySentLead ? existing.meta_delivery : { status: 'waiting_message', eventId: computedEventId })
@@ -58,8 +59,7 @@ export function createTenantIngestion({ request, inbox, mirror = async () => {},
         const shouldPatchMeta = !alreadySentLead && (
           !dispatchLeadEnabled
           || payload.suppressMeta
-          || waitingStates.has(existing?.meta_delivery?.status)
-          || !existing?.meta_delivery?.status
+          || isEligibleState
         );
         const patch = { notes, last_contact_date: timestamp, whatsapp_message_ids: confirmedIds, whatsapp_delivery: delivery,
           ...(shouldPatchMeta ? { meta_delivery: metaDelivery } : {}),
