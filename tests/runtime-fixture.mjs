@@ -10,12 +10,23 @@ process.env.SUPABASE_KEY = 'test-private-key';
 process.env.ADMIN_KEY = 'test-admin';
 const network = globalThis.fetch;
 const rows = [];
+const conversationRows = [];
 globalThis.fetch = async (input, options = {}) => {
   const url = new URL(input);
   if (url.hostname === '127.0.0.1') return network(input, options);
   if (url.hostname !== 'database.test') return new Response('{}', { status: 503 });
   if (url.pathname === '/auth/v1/user') return Response.json({id:'client-user'});
   if (url.pathname === '/rest/v1/tenant_memberships') return Response.json([{tenant_id:'client_a',role:'client'}]);
+  if (url.pathname === '/rest/v1/whatsapp_messages') {
+    const body = options.body && JSON.parse(options.body);
+    if (options.method === 'POST') {
+      const index = conversationRows.findIndex(row => row.tenant_id === body.tenant_id && row.provider_message_id === body.provider_message_id);
+      if (index >= 0) conversationRows[index] = body;
+      else conversationRows.push(body);
+      return Response.json([body]);
+    }
+    return Response.json(conversationRows.filter(row => row.tenant_id === url.searchParams.get('tenant_id')?.slice(3)));
+  }
   const tenant = url.searchParams.get('tenant_id')?.slice(3);
   const body = options.body && JSON.parse(options.body);
   if (options.method === 'POST') { rows.push(body); return Response.json([body]); }
@@ -40,12 +51,18 @@ try {
   assert.equal(unresolved.reason, 'unresolved_lid');
   const alt = await processIncomingMessage(socket, { ...makeMessage('ALT'), key: { id: 'ALT', remoteJid: '1234567890123456@lid', remoteJidAlt: '593988888888@s.whatsapp.net' } }, 'live', 'kindev');
   assert.equal(alt.saved, true);
+  const outgoing = await processIncomingMessage(socket, { ...makeMessage('OUT', 'Respuesta del negocio'), key: { id: 'OUT', remoteJid: '593987654321@s.whatsapp.net', fromMe: true } }, 'live', 'kindev');
+  assert.equal(outgoing.reason, 'from_me');
+  await processIncomingMessage(socket, { ...makeMessage('VIDEO'), message: { videoMessage: { caption: 'texto que no debe guardarse', jpegThumbnail: Buffer.from('media') } } }, 'live', 'kindev');
+  assert.equal(conversationRows.find(row => row.provider_message_id === 'OUT')?.direction, 'outbound');
+  assert.equal(conversationRows.find(row => row.provider_message_id === 'VIDEO')?.body, 'Se recibió un video.');
+  assert.ok(conversationRows.every(row => !JSON.stringify(row).includes('texto que no debe guardarse')));
   server = app.listen(0, '127.0.0.1');
   await new Promise(resolve => server.once('listening', resolve));
   const base = 'http://127.0.0.1:' + server.address().port;
   const status = await (await network(base + '/api/status?tenant=kindev')).json();
   assert.equal(status.version, 'tenant-ingestion-20261108-placeholder-recovery');
-  assert.equal(status.ingestion.saved, 3);
+  assert.equal(status.ingestion.saved, 4);
   const hosted = await processIncomingMessage(socket, { ...makeMessage('HOSTED'), key: { id: 'HOSTED', remoteJid: '593987654321@hosted' } }, 'live', 'hosted_client');
   assert.equal(hosted.saved, true);
   const hostedLid = await processIncomingMessage(socket, { ...makeMessage('HOSTED_LID'), key: { id: 'HOSTED_LID', remoteJid: '1234567@hosted.lid', remoteJidAlt: '593987654321@hosted' } }, 'live', 'hosted_lid_client');
@@ -67,10 +84,13 @@ try {
   const own = await (await network(base + '/api/whatsapp/chat/593987654321?tenant=kindev', { headers: { 'x-admin-key': 'test-admin' } })).json();
   assert.ok(own.messages.length > 0);
   console.log('RUNTIME_OK: socket ingestion, tenant isolation, LID resolution, truthful status and protected APIs');
+} catch (error) {
+  process.stderr.write(String(error?.stack || error) + '\n');
+  process.exitCode = 1;
 } finally {
   server?.close();
   globalThis.fetch = network;
   // Remove only the exact temporary test directory created above.
   fs.rmSync(temporary, { recursive: true, force: true });
-  process.exit(0);
+  process.exit(process.exitCode || 0);
 }

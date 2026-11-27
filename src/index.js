@@ -739,6 +739,48 @@ async function syncFirestoreExistingLeadsCache(force = false) {
 
 // Helper unificado para guardar leads en Cloud Firestore con PROTECCIÓN TOTAL DE DUPLICADOS
 const databaseRequest = createSupabaseRequest(SUPABASE_URL, SUPABASE_KEY);
+function conversationContent(message, direction) {
+  let inner = message?.message;
+  while (inner?.ephemeralMessage?.message || inner?.viewOnceMessage?.message || inner?.viewOnceMessageV2?.message || inner?.documentWithCaptionMessage?.message) {
+    inner = inner.ephemeralMessage?.message || inner.viewOnceMessage?.message || inner.viewOnceMessageV2?.message || inner.documentWithCaptionMessage?.message;
+  }
+  if (!inner) return null;
+  const mediaTypes = [
+    ['videoMessage', 'video'], ['imageMessage', 'imagen'], ['audioMessage', 'audio'],
+    ['documentMessage', 'documento'], ['stickerMessage', 'sticker'],
+    ['locationMessage', 'ubicación'], ['liveLocationMessage', 'ubicación'],
+    ['contactMessage', 'contacto'], ['contactsArrayMessage', 'contacto']
+  ];
+  for (const [key, label] of mediaTypes) {
+    if (inner[key]) return { body: `Se ${direction === 'outbound' ? 'envió' : 'recibió'} ${label === 'audio' ? 'un audio' : label === 'imagen' ? 'una imagen' : label === 'ubicación' ? 'una ubicación' : label === 'contacto' ? 'un contacto' : label === 'sticker' ? 'un sticker' : `un ${label}`}.`, messageType: label };
+  }
+  const text = inner.conversation || inner.extendedTextMessage?.text ||
+    inner.buttonsResponseMessage?.selectedDisplayText || inner.buttonsResponseMessage?.selectedButtonId ||
+    inner.listResponseMessage?.title || inner.templateButtonReplyMessage?.selectedDisplayText ||
+    inner.templateButtonReplyMessage?.selectedId || inner.interactiveResponseMessage?.body?.text || '';
+  const body = String(text).trim().slice(0, 4000);
+  return body ? { body, messageType: 'text' } : null;
+}
+
+async function saveConversationMessage({ tenantId, leadId, phone, message, direction, sentAt }) {
+  if (!message?.key?.id || !leadId || !phone) return;
+  const content = conversationContent(message, direction);
+  if (!content) return;
+  try {
+    await databaseRequest('whatsapp_messages?on_conflict=tenant_id,provider_message_id', {
+      method: 'POST', upsert: true,
+      body: {
+        tenant_id: tenantId, lead_id: String(leadId), phone: cleanPhone(phone), direction,
+        body: content.body, message_type: content.messageType,
+        provider_message_id: String(message.key.id), sent_at: new Date(sentAt).toISOString()
+      }
+    });
+  } catch (error) {
+    // Do not log conversation text or interrupt lead capture if chat supervision storage fails.
+    console.warn(`[Chat:${tenantId}] No se pudo registrar el mensaje ${String(message.key.id).slice(0, 18)}: ${error.message}`);
+  }
+}
+
 async function deliverTenantLead(lead) {
   try {
     const config = await loadTenantConfig(lead.tenant_id);
@@ -794,11 +836,29 @@ setInterval(async () => {
 
 // Buffer en memoria de mensajes recientes para consulta retroactiva (últimos 300)
 const recentMessagesBuffer = [];
+const OMIT_FROM_MESSAGE_CACHE = new Set([
+  'jpegthumbnail', 'thumbnail', 'thumbnailurl', 'thumbnaildirectpath', 'thumbnailsha256',
+  'thumbnailencsha256', 'mediakey', 'filesha256', 'fileencsha256', 'directpath',
+  'streamingsidecar', 'waveform', 'mediacontent', 'mediaurl', 'caption'
+]);
+function stripMediaPayload(value) {
+  if (value === null || value === undefined || typeof value !== 'object') return value;
+  if (Buffer.isBuffer(value) || value instanceof Uint8Array || value instanceof ArrayBuffer) return undefined;
+  if (Array.isArray(value)) return value.map(stripMediaPayload).filter(item => item !== undefined);
+  const clean = {};
+  for (const [key, child] of Object.entries(value)) {
+    if (OMIT_FROM_MESSAGE_CACHE.has(key.toLowerCase())) continue;
+    const sanitized = stripMediaPayload(child);
+    if (sanitized !== undefined) clean[key] = sanitized;
+  }
+  return clean;
+}
 function addToRecentMessagesBuffer(msg, tenantId) {
   if (!msg?.key?.id) return;
   const index = recentMessagesBuffer.findIndex(m => m._tenantId === tenantId && m.key?.id === msg.key.id);
   if (index >= 0) recentMessagesBuffer.splice(index, 1);
-  recentMessagesBuffer.unshift({ ...msg, _tenantId: tenantId });
+  // Keep enough metadata for retry/diagnostics without retaining media bytes or URLs.
+  recentMessagesBuffer.unshift({ ...stripMediaPayload(msg), _tenantId: tenantId });
   if (recentMessagesBuffer.length > 300) recentMessagesBuffer.pop();
 }
 
@@ -875,11 +935,17 @@ async function processIncomingMessage(sock, msg, contextSource = 'live', session
   const reject = reason => { metric(tenantId, reason); return { saved: false, reason }; };
   if (msg.key?.fromMe) {
     if (msg.message?.protocolMessage) return reject('protocol_message');
+    const remoteJid = msg.key?.remoteJid || '';
     const timestamp = msg.messageTimestamp ? Number(msg.messageTimestamp) * 1000 : Date.now();
-    if (Date.now() - timestamp < 72 * 3600000) {
+    if (Date.now() - timestamp < 72 * 3600000 && contextSource !== 'history_sync' && /@(s\.whatsapp\.net|lid|hosted|hosted\.lid)$/.test(remoteJid)) {
       try {
         const { phone } = await resolveRealPhone(sock, msg, sessions.get(tenantId)?.authDir || getTenantAuthDir(tenantId));
         await ingestion.recordOutbound({ tenantId, phone, timestamp });
+        if (phone && conversationContent(msg, 'outbound')) {
+          const digits = cleanPhone(phone);
+          const leads = digits ? await databaseRequest('leads?tenant_id=eq.' + encodeURIComponent(tenantId) + '&phone=in.(' + digits + ',%2B' + digits + ')&select=id&order=created_at.asc&limit=1') : [];
+          if (leads[0]?.id) await saveConversationMessage({ tenantId, leadId: leads[0].id, phone, message: msg, direction: 'outbound', sentAt: timestamp });
+        }
       } catch (error) { metric(tenantId, 'outbound_storage_error'); }
     }
     return reject('from_me');
@@ -911,11 +977,7 @@ async function processIncomingMessage(sock, msg, contextSource = 'live', session
     }
     return reject('empty_payload');
   }
-  const text = inner.conversation || inner.extendedTextMessage?.text || inner.imageMessage?.caption || inner.videoMessage?.caption ||
-    inner.documentMessage?.caption || inner.buttonsResponseMessage?.selectedDisplayText || inner.listResponseMessage?.title ||
-    inner.templateButtonReplyMessage?.selectedDisplayText || inner.interactiveResponseMessage?.body?.text ||
-    (inner.audioMessage ? '[Audio recibido]' : '') ||
-    (inner.imageMessage || inner.videoMessage || inner.documentMessage || inner.stickerMessage ? '[Archivo multimedia recibido]' : '');
+  const text = conversationContent(msg, 'inbound')?.body || '';
   const adInfo = extractMetaAdInfo({ ...msg, message: inner });
   if (!text.trim() && !adInfo) return reject('empty_payload');
   try {
@@ -929,6 +991,9 @@ async function processIncomingMessage(sock, msg, contextSource = 'live', session
       message: text, messageId, adInfo, receivedAt: new Date(timestamp).toISOString(),
       suppressMeta: contextSource === 'history_sync' || /^prueba kindev 0811$/i.test(text.trim()),
       suppressReason: contextSource === 'history_sync' ? 'history_recovery' : 'operator_test', service: adInfo ? 'Anuncio Meta Ads WhatsApp' : 'Contacto Inicial WhatsApp' });
+    if (result.saved && contextSource !== 'history_sync') {
+      await saveConversationMessage({ tenantId, leadId: result.id, phone, message: msg, direction: 'inbound', sentAt: timestamp });
+    }
     if (scopedId) markMessageIdProcessed(scopedId);
     if (messageId) placeholderRecovery.complete(tenantId, messageId);
     state.saved++;
